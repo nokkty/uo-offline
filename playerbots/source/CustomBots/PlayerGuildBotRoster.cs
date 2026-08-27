@@ -48,6 +48,10 @@ namespace Server.CustomBots
             new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> RetiringKeys =
             new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, int> ChatCursors =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> PendingChatReplies =
+            new(StringComparer.OrdinalIgnoreCase);
         private static Func<IReadOnlyList<PlayerGuildBotGuild>> _guildProvider;
         private static bool _initialized;
         private static bool _startupReconcilePending = true;
@@ -194,6 +198,13 @@ namespace Server.CustomBots
         public static void OnGuildCreated(string guildId, string guildTag) =>
             OnGuildCreated(new PlayerGuildBotGuild(guildId, guildTag));
 
+        public static void OnGuildCreated(
+            string guildId,
+            string guildTag,
+            Func<IReadOnlyList<Mobile>> memberProvider) =>
+            OnGuildCreated(new PlayerGuildBotGuild(guildId, guildTag,
+                memberProvider: memberProvider));
+
         public static void OnGuildCreated(PlayerGuildBotGuild guild)
         {
             if (!TryNormalizeGuild(guild, out var normalized))
@@ -318,6 +329,199 @@ namespace Server.CustomBots
                 $"{created} created, {skipped} skipped.");
         }
 
+        // Called by the native guild-chat adapter after a real player's
+        // message has been accepted. Bots never enter this path as speakers.
+        // A per-guild pending guard guarantees at most one delayed response.
+        public static bool HandleGuildMessage(
+            string guildId, Mobile speaker, string text)
+        {
+            if (string.IsNullOrWhiteSpace(guildId) ||
+                string.IsNullOrWhiteSpace(text) ||
+                speaker == null || speaker.Deleted ||
+                speaker is PlayerBot || !speaker.Player)
+            {
+                return false;
+            }
+
+            PlayerGuildBotGuild guild;
+            long generation;
+            guildId = guildId.Trim();
+            lock (LifecycleSync)
+            {
+                if (!ActiveGuilds.TryGetValue(guildId, out guild) ||
+                    !guild.IsActive ||
+                    PendingChatReplies.Contains(guildId))
+                {
+                    return false;
+                }
+                generation = GuildGenerations.TryGetValue(guildId,
+                    out var current) ? current : 0;
+            }
+
+            var snapshot = ActiveSnapshot;
+            if (snapshot == null)
+            {
+                return false;
+            }
+
+            var responders = FindChatResponders(guildId, snapshot);
+            if (responders.Count == 0)
+            {
+                return false;
+            }
+
+            ChatResponder selected;
+            lock (LifecycleSync)
+            {
+                if (!ActiveGuilds.ContainsKey(guildId) ||
+                    PendingChatReplies.Contains(guildId))
+                {
+                    return false;
+                }
+                int cursor = ChatCursors.TryGetValue(guildId, out var previous)
+                    ? previous
+                    : 0;
+                selected = responders[cursor % responders.Count];
+                ChatCursors[guildId] = (cursor + 1) % responders.Count;
+                PendingChatReplies.Add(guildId);
+            }
+
+            int delay = Utility.RandomMinMax(2, 5);
+            Timer.DelayCall(TimeSpan.FromSeconds(delay), () =>
+                DeliverGuildReply(guildId, selected.Persona.Id, generation));
+            return true;
+        }
+
+        private static List<ChatResponder> FindChatResponders(
+            string guildId, PlayerGuildBotRosterSnapshot snapshot)
+        {
+            var bots = FindRosterBots(guildId, null);
+            var responders = new List<ChatResponder>();
+            foreach (var persona in snapshot.Personas)
+            {
+                if (!HasChatLines(persona.ChatCategories))
+                {
+                    continue;
+                }
+                var bot = bots.FirstOrDefault(candidate =>
+                    string.Equals(candidate.PlayerGuildPersonaId, persona.Id,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    IsOnlineRosterBot(candidate));
+                if (bot != null)
+                {
+                    responders.Add(new ChatResponder(persona));
+                }
+            }
+            return responders;
+        }
+
+        private static bool HasChatLines(IReadOnlyList<string> categories)
+        {
+            if (categories == null)
+            {
+                return false;
+            }
+            foreach (var category in categories)
+            {
+                if (ChatLibrary.CategoryCount(category) > 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool IsOnlineRosterBot(PlayerBot bot) =>
+            bot != null && !bot.Deleted && bot.Alive && !bot.LoggingOut &&
+            bot.Map != null && bot.Map != Map.Internal;
+
+        private static void DeliverGuildReply(
+            string guildId, string personaId, long generation)
+        {
+            PlayerGuildBotGuild guild;
+            lock (LifecycleSync)
+            {
+                PendingChatReplies.Remove(guildId);
+                if (!ActiveGuilds.TryGetValue(guildId, out guild) ||
+                    !guild.IsActive ||
+                    GuildGenerations.TryGetValue(guildId, out var current) &&
+                        current != generation)
+                {
+                    return;
+                }
+            }
+
+            var snapshot = ActiveSnapshot;
+            if (snapshot == null || !snapshot.TryGetPersona(personaId, out var persona))
+            {
+                return;
+            }
+
+            var bot = FindRosterBots(guildId, personaId)
+                .FirstOrDefault(IsOnlineRosterBot);
+            if (bot == null)
+            {
+                return;
+            }
+
+            var line = ChatLibrary.PickRandom(persona.ChatCategories?.ToArray());
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return;
+            }
+
+            var recipients = GetGuildMembers(guild);
+            int sent = 0;
+            foreach (var member in recipients)
+            {
+                if (!IsOnlineRealMember(member))
+                {
+                    continue;
+                }
+                try
+                {
+                    // Mobile.SendMessage handles transport details for a real
+                    // member; this path never reads a bot NetState.
+                    member.SendMessage(0x3B2, $"{bot.Name}: {line}");
+                    sent++;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guildId}' reply delivery " +
+                        $"to '{member.Name}' failed: {ex.Message}");
+                }
+            }
+
+            if (sent == 0)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guildId}' reply skipped: " +
+                    "no online real members.");
+            }
+        }
+
+        private static IReadOnlyList<Mobile> GetGuildMembers(PlayerGuildBotGuild guild)
+        {
+            try
+            {
+                return guild.MemberProvider?.Invoke() ?? guild.Members ??
+                    Array.Empty<Mobile>();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' member enumeration failed: " +
+                    ex.Message);
+                return Array.Empty<Mobile>();
+            }
+        }
+
+        private static bool IsOnlineRealMember(Mobile member) =>
+            member != null && !member.Deleted && member.Player &&
+            member.Map != null && member.Map != Map.Internal &&
+            member is not PlayerBot;
+
         public static RosterLoadResult Reload()
         {
             var errors = new List<string>();
@@ -370,6 +574,17 @@ namespace Server.CustomBots
                         $"({candidate.Personas.Count} persona(s)).");
                     var result = new RosterLoadResult(true, candidate.Version,
                         candidate.Personas.Count, Array.Empty<string>());
+                    try
+                    {
+                        // A valid roster reload also refreshes editable chat
+                        // categories; an invalid roster never reaches here.
+                        ChatLibrary.Load();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"[PlayerGuildBotRoster] chat reload failed: {ex.Message}");
+                    }
                     if (_initialized)
                     {
                         ScheduleReconcile();
@@ -642,6 +857,8 @@ namespace Server.CustomBots
                 GuildGenerations[guildId] = GuildGenerations.TryGetValue(guildId,
                     out var generation) ? generation + 1 : 1;
                 PendingRecoveryKeys.RemoveWhere(key => IsGuildKey(key, guildId));
+                PendingChatReplies.Remove(guildId);
+                ChatCursors.Remove(guildId);
             }
 
             var bots = FindRosterBots(guildId, null);
@@ -784,7 +1001,8 @@ namespace Server.CustomBots
                 return false;
             }
             normalized = new PlayerGuildBotGuild(
-                guild.Id.Trim(), guild.Tag.Trim(), isActive: true);
+                guild.Id.Trim(), guild.Tag.Trim(), isActive: true,
+                memberProvider: guild.MemberProvider, members: guild.Members);
             return true;
         }
 
@@ -1396,16 +1614,35 @@ namespace Server.CustomBots
 
     public sealed class PlayerGuildBotGuild
     {
-        public PlayerGuildBotGuild(string id, string tag, bool isActive = true)
+        public PlayerGuildBotGuild(
+            string id,
+            string tag,
+            bool isActive = true,
+            Func<IReadOnlyList<Mobile>> memberProvider = null,
+            IReadOnlyList<Mobile> members = null)
         {
             Id = id;
             Tag = tag;
             IsActive = isActive;
+            MemberProvider = memberProvider;
+            Members = members;
         }
 
         public string Id { get; }
         public string Tag { get; }
         public bool IsActive { get; }
+        public Func<IReadOnlyList<Mobile>> MemberProvider { get; }
+        public IReadOnlyList<Mobile> Members { get; }
+    }
+
+    internal sealed class ChatResponder
+    {
+        public ChatResponder(PlayerGuildBotPersona persona)
+        {
+            Persona = persona;
+        }
+
+        public PlayerGuildBotPersona Persona { get; }
     }
 
     public sealed class RosterLoadResult

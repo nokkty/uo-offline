@@ -20,6 +20,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Server;
 
 namespace Server.CustomBots
@@ -79,6 +80,11 @@ namespace Server.CustomBots
         // their spawners) and force an immediate respawn, so the roads
         // refill with reds rolled under the current PK templates.
         private static readonly string PKFreshReq = Live("pkfresh_request.txt");
+        // guildbots_request.txt: one monotonically increasing token. The
+        // watcher runs a disposable player-guild scenario and writes a compact
+        // pass/fail report to guildbots_ack.json.
+        private static readonly string GuildBotsReq = Live("guildbots_request.txt");
+        private static readonly string GuildBotsAck = Live("guildbots_ack.json");
 
         private static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
         private static long _lastReload = -1;
@@ -102,6 +108,8 @@ namespace Server.CustomBots
         private static long _lastPartyTest = -1;
         private static long _lastT2A = -1;
         private static long _lastPKFresh = -1;
+        private static long _lastGuildBots = -1;
+        private static GuildBotsScenario _guildBotsScenario;
         private static Timer _timer;
 
         // ModernUO calls Initialize() after the world loads — registries and
@@ -130,6 +138,9 @@ namespace Server.CustomBots
             _lastPartyTest = ReadCoordRequest(PartyTestReq, out _) ?? 0;
             _lastT2A = ReadToken(T2AReq) ?? 0;
             _lastPKFresh = ReadToken(PKFreshReq) ?? 0;
+            // Seed stale editor tokens at boot; only a changed token starts a
+            // scenario, matching every other one-way watcher bridge.
+            _lastGuildBots = ReadGuildBotsRequest() ?? 0;
             _timer = Timer.DelayCall(Interval, Interval, Poll);
         }
 
@@ -298,6 +309,49 @@ namespace Server.CustomBots
                 _lastPKFresh = pkFreshTok.Value;
                 DoPKFresh(pkFreshTok.Value);
             }
+
+            var guildBotsTok = ReadGuildBotsRequest();
+            if (guildBotsTok != null && guildBotsTok.Value != _lastGuildBots)
+            {
+                _lastGuildBots = guildBotsTok.Value;
+                DoGuildBots(guildBotsTok.Value);
+            }
+        }
+
+        private static long? ReadGuildBotsRequest()
+        {
+            try
+            {
+                if (!File.Exists(GuildBotsReq))
+                {
+                    return null;
+                }
+                var parts = File.ReadAllText(GuildBotsReq).Split(
+                    new[] { ' ', '\t', '\r', '\n' },
+                    StringSplitOptions.RemoveEmptyEntries);
+                return parts.Length > 0 && long.TryParse(parts[0], out var token)
+                    ? token
+                    : null;
+            }
+            catch
+            {
+                return null; // file may be mid-write; retry next tick
+            }
+        }
+
+        private static void DoGuildBots(long token)
+        {
+            if (_guildBotsScenario != null)
+            {
+                const string error = "scenario already running; retry after its ack is written";
+                Console.WriteLine(
+                    $"[EditorReload] guildbots token {token} ignored: {error}.");
+                WriteAck(GuildBotsAck,
+                    $"{{\"token\":{token},\"passed\":false,\"errors\":[\"{error}\"]}}");
+                return;
+            }
+            _guildBotsScenario = new GuildBotsScenario(token);
+            _guildBotsScenario.Start();
         }
 
         // pkfresh_request.txt: cull the live PK bots (spawners untouched)
@@ -1252,6 +1306,715 @@ namespace Server.CustomBots
                 $"[EditorReload] regenerated bot population: {spawners} spawner(s) (token {token}).");
 
             WriteAck(GenAck, $"{{\"token\":{token},\"spawners\":{spawners}}}");
+        }
+
+        // -------------------------------------------------------------------
+        // guildbots_request.txt: disposable roster E2E. The scenario uses the
+        // typed PlayerGuildBotGuild adapter boundary, so it remains usable
+        // across ModernUO guild API revisions without a speculative engine
+        // dependency. Every run cleans its fixed test identity before and
+        // after execution; no native guild catalog or permanent guild is
+        // changed.
+        // -------------------------------------------------------------------
+        private sealed class GuildBotsScenario
+        {
+            private const string TestGuildId = "__guildbots_headless__";
+
+            private readonly long _token;
+            private readonly string _testGuildTag;
+            private readonly List<GuildBotsAssertion> _assertions = new();
+            private readonly List<GuildBotsDelivery> _deliveries = new();
+            private readonly List<string> _errors = new();
+            private readonly int _syntheticGuildCount = BotGuilds.All.Length;
+            private readonly string _syntheticGuildFingerprint;
+            private string _originalRoster;
+            private PlayerGuildBotRosterSnapshot _initialSnapshot;
+            private PlayerGuildBotGuild _guild;
+            private Server.Mobiles.PlayerMobile _member;
+            private PlayerBot _partyBot;
+            private int _baselineReservations;
+            private bool _firstChatAccepted;
+            private DateTime _firstChatStarted;
+            private DateTime _secondChatStarted;
+            private bool _finished;
+
+            public GuildBotsScenario(long token)
+            {
+                _token = token;
+                var suffix = ((token % 1000) + 1000) % 1000;
+                _testGuildTag = $"HBT{suffix:000}";
+                _syntheticGuildFingerprint = SyntheticGuildFingerprint();
+            }
+
+            public void Start()
+            {
+                try
+                {
+                    _originalRoster = File.ReadAllText(PlayerGuildBotRoster.ConfigurationPath);
+                    _initialSnapshot = PlayerGuildBotRoster.ActiveSnapshot;
+                    Check(_initialSnapshot != null, "configuration.active",
+                        "a valid roster snapshot must be active before the scenario starts");
+                    if (_initialSnapshot == null)
+                    {
+                        Finish();
+                        return;
+                    }
+
+                    // Remove leftovers from a crashed prior run before checking
+                    // the real-guild gate. The ID is deliberately namespaced.
+                    PlayerGuildBotRoster.OnGuildDisbanded(TestGuildId);
+                    _baselineReservations = NamePool.ReservedCount;
+                    Check(CountBots() == 0, "gating.noBots",
+                        "no disposable roster bots exist before guild creation");
+                    Check(NoNamesReserved(_initialSnapshot), "gating.noReservations",
+                        "no disposable roster names are reserved before guild creation");
+                    Check(!PlayerGuildBotRoster.HandleGuildMessage(
+                            TestGuildId, null, "before guild"),
+                        "gating.noChat", "inactive guilds do not produce roster replies");
+
+                    _member = new Server.Mobiles.PlayerMobile
+                    {
+                        Name = "GuildBots Tester",
+                        Body = 0x190,
+                        Hue = 0x83EA,
+                        Player = true,
+                    };
+                    var loc = TestLocation();
+                    _member.MoveToWorld(loc, Map.Felucca);
+                    _guild = new PlayerGuildBotGuild(
+                        TestGuildId, _testGuildTag, members: new Mobile[] { _member });
+
+                    PlayerGuildBotRoster.OnGuildCreated(_guild);
+                    AssertRoster(_initialSnapshot, "reconcile.create");
+                    int firstCount = CountBots();
+                    PlayerGuildBotRoster.OnGuildCreated(_guild);
+                    Check(CountBots() == firstCount, "reconcile.idempotent",
+                        "repeating create does not duplicate bots");
+                    Check(CountBots() == _initialSnapshot.Personas.Count,
+                        "reconcile.onePerPersona", "one live bot exists per configured persona");
+
+                    CheckAmbientAndSyntheticBoundaries();
+                    StartDeletionCheck();
+                }
+                catch (Exception ex)
+                {
+                    Fail("start", ex);
+                    Finish();
+                }
+            }
+
+            private void StartDeletionCheck()
+            {
+                try
+                {
+                    var persona = _initialSnapshot.Personas[0];
+                    var bots = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, persona.Id);
+                    Check(bots.Count == 1, "recovery.beforeDelete",
+                        "a live persona is available for targeted deletion recovery");
+                    if (bots.Count == 1)
+                    {
+                        bots[0].Delete();
+                    }
+                    Timer.DelayCall(TimeSpan.FromSeconds(2), AfterDeletion);
+                }
+                catch (Exception ex)
+                {
+                    Fail("recovery.start", ex);
+                    StartChatCheck();
+                }
+            }
+
+            private void AfterDeletion()
+            {
+                if (_finished) return;
+                try
+                {
+                    var persona = _initialSnapshot.Personas[0];
+                    var bots = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, persona.Id);
+                    PlayerGuildBotRoster.TryGetBinding(
+                        TestGuildId, persona.Id, out var binding);
+                    Check(bots.Count == 1 && binding != null &&
+                            NamePool.IsReserved(binding.ExactName) &&
+                            string.Equals(bots[0].Name, binding.ExactName,
+                                StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(bots[0].HomeCity, binding.HomeCity,
+                                StringComparison.OrdinalIgnoreCase),
+                        "recovery.sameIdentity",
+                        "deleted persona is recreated with the same name and home city");
+                    StartChatCheck();
+                }
+                catch (Exception ex)
+                {
+                    Fail("recovery.finish", ex);
+                    StartChatCheck();
+                }
+            }
+
+            private void StartChatCheck()
+            {
+                try
+                {
+                    PlayerGuildBotRoster.GuildChatReplyDelivered += OnChatDelivery;
+                    var botSpeaker = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId).FirstOrDefault();
+                    Check(botSpeaker != null && !PlayerGuildBotRoster.HandleGuildMessage(
+                            TestGuildId, botSpeaker, "bot speech"),
+                        "chat.botSpeakerIgnored", "bot-generated speech cannot trigger a roster reply");
+                    _firstChatStarted = DateTime.UtcNow;
+                    _firstChatAccepted = PlayerGuildBotRoster.HandleGuildMessage(
+                        TestGuildId, _member, "hello roster");
+                    bool duplicate = PlayerGuildBotRoster.HandleGuildMessage(
+                        TestGuildId, _member, "hello again");
+                    Check(_firstChatAccepted, "chat.firstAccepted",
+                        "a configured online roster can schedule a guild reply");
+                    Check(!duplicate, "chat.atMostOne",
+                        "a guild has at most one pending reply at a time");
+                    Timer.DelayCall(TimeSpan.FromSeconds(7), AfterFirstChat);
+                }
+                catch (Exception ex)
+                {
+                    Fail("chat.start", ex);
+                    try
+                    {
+                        RunConfigChecks();
+                        StartPartyCheck();
+                    }
+                    catch (Exception followup)
+                    {
+                        Fail("chat.start.followup", followup);
+                        Finish();
+                    }
+                }
+            }
+
+            private void AfterFirstChat()
+            {
+                if (_finished) return;
+                try
+                {
+                    Check(_deliveries.Count <= 1, "chat.firstDelivery",
+                        $"first message produced {_deliveries.Count} delivery callback(s)");
+                    _secondChatStarted = DateTime.UtcNow;
+                    bool second = PlayerGuildBotRoster.HandleGuildMessage(
+                        TestGuildId, _member, "second hello");
+                    Check(!_firstChatAccepted || second, "chat.secondAccepted",
+                        "a second message can schedule after the first delay completes");
+                    Timer.DelayCall(TimeSpan.FromSeconds(7), AfterSecondChat);
+                }
+                catch (Exception ex)
+                {
+                    Fail("chat.first", ex);
+                    Finish();
+                }
+            }
+
+            private void AfterSecondChat()
+            {
+                if (_finished) return;
+                try
+                {
+                    Check(_deliveries.Count <= 2, "chat.deliveryBound",
+                        $"two messages produced {_deliveries.Count} delivery callback(s)");
+                    if (_firstChatAccepted)
+                    {
+                        bool delivered = false;
+                        foreach (var delivery in _deliveries)
+                        {
+                            if (delivery.RecipientCount > 0)
+                            {
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        Check(delivered, "chat.clientlessDelivery",
+                            "a configured response reached at least one real recipient");
+                        Check(_deliveries.Count >= 2, "chat.twoMessages",
+                            "both scheduled messages complete after their bounded delay");
+                        if (_deliveries.Count >= 2 && _initialSnapshot.Personas.Count > 1)
+                        {
+                            Check(!string.Equals(_deliveries[0].PersonaId,
+                                    _deliveries[1].PersonaId,
+                                    StringComparison.OrdinalIgnoreCase),
+                                "chat.roundRobin", "successive replies use different personas");
+                        }
+                    }
+                    RunConfigChecks();
+                    StartPartyCheck();
+                }
+                catch (Exception ex)
+                {
+                    Fail("chat.second", ex);
+                    Finish();
+                }
+            }
+
+            private void RunConfigChecks()
+            {
+                var original = new List<PlayerGuildBotPersona>();
+                foreach (var persona in _initialSnapshot.Personas)
+                {
+                    original.Add(persona);
+                }
+                if (original.Count == 0)
+                {
+                    Fail("config.personas", "the active roster has no personas");
+                    return;
+                }
+
+                var removed = original[original.Count - 1];
+                PlayerGuildBotRoster.TryGetBinding(
+                    TestGuildId, removed.Id, out var removedBinding);
+                var withoutRemoved = new List<PlayerGuildBotPersona>(original);
+                withoutRemoved.RemoveAt(withoutRemoved.Count - 1);
+                WriteRoster(withoutRemoved);
+                var removeLoad = PlayerGuildBotRoster.Reload(scheduleReconcile: false);
+                Check(removeLoad.Success, "config.retireReload",
+                    "valid persona removal reloads successfully");
+                PlayerGuildBotRoster.OnGuildCreated(_guild);
+                Check(PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, removed.Id).Count == 0,
+                    "config.retireBot", "removed persona is retired from the live guild");
+                Check(removedBinding != null && !NamePool.IsReserved(removedBinding.ExactName),
+                    "config.retireReservation",
+                    "retired persona releases its name while retaining historical state");
+                Check(removedBinding != null && PlayerGuildBotRoster.TryGetBinding(
+                        TestGuildId, removed.Id, out _),
+                    "config.retireState", "retired persona keeps its binding for re-add");
+
+                var extra = new PlayerGuildBotPersona(
+                    "headless-extra", "HeadlessExtra", false, BotClass.Warrior,
+                    BotSkillTier.Expert, original[0].Behavior, new[] { "guild_chat" });
+                var withExtra = new List<PlayerGuildBotPersona>(original) { extra };
+                WriteRoster(withExtra);
+                var addLoad = PlayerGuildBotRoster.Reload(scheduleReconcile: false);
+                Check(addLoad.Success, "config.addReload",
+                    "valid persona addition reloads successfully");
+                PlayerGuildBotRoster.OnGuildCreated(_guild);
+                Check(PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, extra.Id).Count == 1,
+                    "config.addBot", "new persona is reconciled for the active guild");
+                Check(PlayerGuildBotRoster.GetRosterView(TestGuildId)?.Personas.Count ==
+                        withExtra.Count,
+                    "config.addView", "roster view includes the added persona");
+
+                var beforeInvalid = PlayerGuildBotRoster.ActiveSnapshot;
+                WriteRosterText("{ invalid roster");
+                var invalid = PlayerGuildBotRoster.Reload(scheduleReconcile: false);
+                Check(!invalid.Success && ReferenceEquals(beforeInvalid,
+                        PlayerGuildBotRoster.ActiveSnapshot),
+                    "config.invalidRetention",
+                    "invalid reload retains the last valid snapshot");
+                var invalidErrorText = invalid.Errors.Count == 0
+                    ? "no validation error was returned"
+                    : string.Join(" | ", invalid.Errors);
+                Check(invalid.Errors.Any(error => error.Contains("Invalid JSON",
+                        StringComparison.OrdinalIgnoreCase)),
+                    "config.invalidError", $"invalid reload error: {invalidErrorText}");
+
+                var conflict = new PlayerGuildBotPersona(
+                    "headless-conflict", original[0].BaseName, original[0].Female,
+                    original[0].Class, original[0].SkillTier, original[0].Behavior,
+                    original[0].ChatCategories);
+                var withConflict = new List<PlayerGuildBotPersona>(withExtra) { conflict };
+                WriteRoster(withConflict);
+                var conflictLoad = PlayerGuildBotRoster.Reload(scheduleReconcile: false);
+                Check(conflictLoad.Success, "config.conflictReload",
+                    "conflict candidate remains structurally valid");
+                int reservationsBefore = NamePool.ReservedCount;
+                PlayerGuildBotRoster.OnGuildCreated(_guild);
+                Check(PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, conflict.Id).Count == 0,
+                    "config.conflictSkip",
+                    $"conflicting name '{withConflict[0].BaseName} of {_testGuildTag}' " +
+                    "is skipped without renaming");
+                Check(NamePool.ReservedCount == reservationsBefore,
+                    "config.conflictReservation",
+                    $"conflict owner '{conflict.Id}' does not leak a reservation");
+
+                WriteRoster(withExtra);
+                Check(PlayerGuildBotRoster.Reload(scheduleReconcile: false).Success,
+                    "config.restoreAdded", "valid roster is restored after conflict check");
+                PlayerGuildBotRoster.OnGuildCreated(_guild);
+                Check(PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, extra.Id).Count == 1,
+                    "config.restoreAddedBot", "added persona survives restoration");
+
+                WriteRoster(original);
+                Check(PlayerGuildBotRoster.Reload(scheduleReconcile: false).Success,
+                    "config.restoreOriginal", "original roster reloads successfully");
+                PlayerGuildBotRoster.OnGuildCreated(_guild);
+                Check(CountBots() == original.Count, "config.restoreCount",
+                    "restoring the original roster retires the temporary persona");
+                Check(removedBinding != null &&
+                        PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                            TestGuildId, removed.Id).Count == 1 &&
+                        string.Equals(GetBotName(removed.Id), removedBinding.ExactName,
+                            StringComparison.OrdinalIgnoreCase),
+                    "config.readdIdentity", "re-added persona recovers its exact historical name");
+            }
+
+            private void StartPartyCheck()
+            {
+                try
+                {
+                    foreach (var persona in PlayerGuildBotRoster.ActiveSnapshot.Personas)
+                    {
+                        if (BotClassHelper.IsArtisan(persona.Class) ||
+                            BotClassHelper.IsGatherer(persona.Class) ||
+                            persona.Class == BotClass.Crafter)
+                        {
+                            continue;
+                        }
+                        var bots = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                            TestGuildId, persona.Id);
+                        if (bots.Count == 0) continue;
+                        _partyBot = bots[0];
+                        break;
+                    }
+
+                    Check(_partyBot != null, "party.eligiblePersona",
+                        "at least one configured roster bot is party-eligible");
+                    if (_partyBot == null)
+                    {
+                        BeginDisbandCheck();
+                        return;
+                    }
+
+                    Server.Engines.PartySystem.Party.Invite(_member, _partyBot);
+                    BotPlayerParty.CheckInvite(_partyBot);
+                    Timer.DelayCall(TimeSpan.FromSeconds(4), AfterParty);
+                }
+                catch (Exception ex)
+                {
+                    Fail("party.start", ex);
+                    BeginDisbandCheck();
+                }
+            }
+
+            private void AfterParty()
+            {
+                if (_finished) return;
+                try
+                {
+                    bool joined = BotPlayerParty.InPlayerParty(_partyBot);
+                    Check(joined, "party.join", "roster bot accepts a normal player invitation");
+                    if (_partyBot?.Party is Server.Engines.PartySystem.Party party)
+                    {
+                        party.Disband();
+                    }
+                    _partyBot.Party = null;
+                    if (_partyBot.Behavior is PlayerGroupBehavior group)
+                    {
+                        group.Tick(_partyBot);
+                    }
+                    Check(_partyBot != null &&
+                            string.Equals(_partyBot.ConfiguredBehaviorName,
+                                _partyBot.Behavior?.SerializableName,
+                                StringComparison.OrdinalIgnoreCase),
+                        "party.restoreBehavior",
+                        "leaving a player party restores configured roster behavior");
+                    BeginDisbandCheck();
+                }
+                catch (Exception ex)
+                {
+                    Fail("party.finish", ex);
+                    BeginDisbandCheck();
+                }
+            }
+
+            private void BeginDisbandCheck()
+            {
+                if (_finished) return;
+                try
+                {
+                    int before = _deliveries.Count;
+                    bool pending = PlayerGuildBotRoster.HandleGuildMessage(
+                        TestGuildId, _member, "disband pending");
+                    PlayerGuildBotRoster.OnGuildDisbanded(TestGuildId);
+                    Check(CountBots() == 0, "disband.bots", "disband removes every roster bot");
+                    Check(PlayerGuildBotRoster.GetBindings(TestGuildId).Count == 0,
+                        "disband.state", "disband removes disposable roster state");
+                    Check(NoNamesReserved(_initialSnapshot) &&
+                            NamePool.ReservedCount == _baselineReservations,
+                        "disband.reservations",
+                        "disband releases every disposable roster reservation");
+                    Timer.DelayCall(TimeSpan.FromSeconds(6), () =>
+                    {
+                        if (_finished) return;
+                        Check(!pending || _deliveries.Count == before,
+                            "disband.chatCancel", "disband cancels pending delayed replies");
+                        Finish();
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Fail("disband", ex);
+                    Finish();
+                }
+            }
+
+            private void OnChatDelivery(string guildId, string personaId,
+                string senderName, int recipientCount)
+            {
+                if (!string.Equals(guildId, TestGuildId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+                var started = _deliveries.Count == 0
+                    ? _firstChatStarted
+                    : _secondChatStarted;
+                var elapsed = started == DateTime.MinValue
+                    ? 0
+                    : (DateTime.UtcNow - started).TotalSeconds;
+                _deliveries.Add(new GuildBotsDelivery
+                {
+                    PersonaId = personaId,
+                    SenderName = senderName,
+                    RecipientCount = recipientCount,
+                    DelaySeconds = elapsed,
+                });
+                Check(elapsed >= 1.5 && elapsed <= 7.0, "chat.delay",
+                    $"reply callback arrived after {elapsed:0.0}s (expected 2-5s)");
+                if (recipientCount > 0)
+                {
+                    var binding = PlayerGuildBotRoster.GetBindings(TestGuildId)
+                        .FirstOrDefault(item => string.Equals(item.PersonaId, personaId,
+                            StringComparison.OrdinalIgnoreCase));
+                    Check(binding != null && string.Equals(binding.ExactName, senderName,
+                            StringComparison.OrdinalIgnoreCase),
+                        "chat.exactSender", "chat sender matches the persisted in-world name");
+                }
+            }
+
+            private void CheckAmbientAndSyntheticBoundaries()
+            {
+                int ambientBefore = NamePool.InUseCount - NamePool.LiveReservedCount;
+                bool allowBefore = BotSessionManager.AllowSpawn();
+                Check(_syntheticGuildCount == BotGuilds.All.Length &&
+                        string.Equals(_syntheticGuildFingerprint, SyntheticGuildFingerprint(),
+                            StringComparison.Ordinal),
+                    "compat.syntheticGuilds", "synthetic BotGuilds catalog remains unchanged");
+                foreach (var bot in PlayerGuildBotRoster.GetRosterBotsForDiagnostics(TestGuildId))
+                {
+                    Check(bot.IsPlayerGuildBot && !bot.LifecycleExempt &&
+                            bot.BotGuildIndex < 0 && bot.NetState == null &&
+                            !IsNativeGuildMember(bot),
+                        $"identity.bound.{bot.PlayerGuildPersonaId}",
+                        "roster identity is separate from synthetic/native guild membership");
+                }
+                int ambientAfter = NamePool.InUseCount - NamePool.LiveReservedCount;
+                Check(ambientBefore == ambientAfter && allowBefore == BotSessionManager.AllowSpawn(),
+                    "population.ambientBoundary",
+                    "roster names do not consume ambient population accounting");
+            }
+
+            private static string SyntheticGuildFingerprint()
+            {
+                var parts = new List<string>(BotGuilds.All.Length);
+                foreach (var guild in BotGuilds.All)
+                {
+                    parts.Add($"{guild.Name}:{guild.Tag}:{guild.Weight}:{guild.Faction}");
+                }
+                return string.Join("|", parts);
+            }
+
+            private bool IsNativeGuildMember(PlayerBot bot)
+            {
+                if (_guild?.Members == null)
+                {
+                    return false;
+                }
+                foreach (var member in _guild.Members)
+                {
+                    if (ReferenceEquals(member, bot))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            private void AssertRoster(PlayerGuildBotRosterSnapshot snapshot, string prefix)
+            {
+                int total = 0;
+                foreach (var persona in snapshot.Personas)
+                {
+                    var bots = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, persona.Id);
+                    total += bots.Count;
+                    PlayerGuildBotRoster.TryGetBinding(
+                        TestGuildId, persona.Id, out var binding);
+                    Check(bots.Count == 1, $"{prefix}.count.{persona.Id}",
+                        $"expected one live bot, found {bots.Count}");
+                    if (bots.Count == 0 || binding == null) continue;
+                    var bot = bots[0];
+                    Check(string.Equals(bot.Name, binding.ExactName,
+                            StringComparison.OrdinalIgnoreCase) &&
+                            !bot.Name.Contains("[", StringComparison.Ordinal) &&
+                            bot.Female == persona.Female && bot.Class == persona.Class &&
+                            bot.SkillTier == persona.SkillTier &&
+                            string.Equals(bot.ConfiguredBehaviorName, persona.Behavior,
+                                StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(bot.Behavior?.SerializableName, persona.Behavior,
+                                StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(bot.HomeCity, binding.HomeCity,
+                                StringComparison.OrdinalIgnoreCase),
+                        $"{prefix}.identity.{persona.Id}",
+                        "name, gender, class, tier, behavior, and home city match state/config");
+                }
+                Check(total == snapshot.Personas.Count, $"{prefix}.total",
+                    $"expected {snapshot.Personas.Count} roster bots, found {total}");
+            }
+
+            private bool NoNamesReserved(PlayerGuildBotRosterSnapshot snapshot)
+            {
+                foreach (var persona in snapshot.Personas)
+                {
+                    var name = snapshot.FormatName(persona.BaseName, _testGuildTag);
+                    if (NamePool.IsReserved(name)) return false;
+                }
+                return true;
+            }
+
+            private int CountBots() => PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                TestGuildId).Count;
+
+            private string GetBotName(string personaId)
+            {
+                var bots = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                    TestGuildId, personaId);
+                return bots.Count == 0 ? null : bots[0].Name;
+            }
+
+            private Point3D TestLocation()
+            {
+                const int x = 1424;
+                const int y = 1683;
+                int z = Walkable.TryFindSeedZ(Map.Felucca, x, y, 0, out var seedZ)
+                    ? seedZ
+                    : Map.Felucca.GetAverageZ(x, y);
+                return new Point3D(x, y, z);
+            }
+
+            private void WriteRoster(IReadOnlyList<PlayerGuildBotPersona> personas)
+            {
+                var records = new List<object>();
+                foreach (var persona in personas)
+                {
+                    records.Add(new
+                    {
+                        id = persona.Id,
+                        baseName = persona.BaseName,
+                        female = persona.Female,
+                        @class = persona.Class.ToString(),
+                        skillTier = persona.SkillTier.ToString(),
+                        behavior = persona.Behavior,
+                        chatCategories = persona.ChatCategories,
+                    });
+                }
+                var document = new
+                {
+                    version = PlayerGuildBotRoster.CurrentConfigVersion,
+                    nameFormat = PlayerGuildBotRoster.ActiveSnapshot.NameFormat,
+                    spawnRadius = PlayerGuildBotRoster.ActiveSnapshot.SpawnRadius,
+                    personas = records,
+                };
+                WriteRosterText(System.Text.Json.JsonSerializer.Serialize(document,
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            }
+
+            private void WriteRosterText(string text) =>
+                File.WriteAllText(PlayerGuildBotRoster.ConfigurationPath, text);
+
+            private void Check(bool passed, string name, string detail)
+            {
+                _assertions.Add(new GuildBotsAssertion
+                {
+                    Name = name,
+                    Passed = passed,
+                    Detail = detail,
+                });
+                if (!passed)
+                {
+                    _errors.Add($"{name}: {detail}");
+                }
+            }
+
+            private void Fail(string name, Exception ex) =>
+                Fail(name, ex?.Message ?? "unknown error");
+
+            private void Fail(string name, string detail)
+            {
+                Check(false, name, detail);
+            }
+
+            private void Finish()
+            {
+                if (_finished) return;
+                _finished = true;
+                try
+                {
+                    PlayerGuildBotRoster.GuildChatReplyDelivered -= OnChatDelivery;
+                    if (_member?.Party is Server.Engines.PartySystem.Party party)
+                    {
+                        party.Disband();
+                    }
+                    PlayerGuildBotRoster.OnGuildDisbanded(TestGuildId);
+                    if (_member != null && !_member.Deleted)
+                    {
+                        _member.Delete();
+                    }
+                    if (_originalRoster != null)
+                    {
+                        WriteRosterText(_originalRoster);
+                        var restored = PlayerGuildBotRoster.Reload(scheduleReconcile: false);
+                        if (!restored.Success)
+                        {
+                            Fail("cleanup.restoreRoster", "failed to restore the original roster file");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Fail("cleanup", ex);
+                }
+
+                var ack = new
+                {
+                    token = _token,
+                    passed = _errors.Count == 0,
+                    assertions = _assertions,
+                    errors = _errors,
+                    deliveryCount = _deliveries.Count,
+                    botsRemaining = CountBots(),
+                    reservationsRemaining = NamePool.ReservedCount,
+                    pendingGuildReplies = PlayerGuildBotRoster.PendingGuildChatReplyCount,
+                    syntheticGuildCount = BotGuilds.All.Length,
+                    guildAdapter = "PlayerGuildBotGuild snapshot",
+                };
+                WriteAck(GuildBotsAck,
+                    System.Text.Json.JsonSerializer.Serialize(ack,
+                        new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+                _guildBotsScenario = null;
+            }
+
+            private sealed class GuildBotsAssertion
+            {
+                public string Name { get; set; }
+                public bool Passed { get; set; }
+                public string Detail { get; set; }
+            }
+
+            private sealed class GuildBotsDelivery
+            {
+                public string PersonaId { get; set; }
+                public string SenderName { get; set; }
+                public int RecipientCount { get; set; }
+                public double DelaySeconds { get; set; }
+            }
         }
 
         private static void WriteAck(string path, string json)

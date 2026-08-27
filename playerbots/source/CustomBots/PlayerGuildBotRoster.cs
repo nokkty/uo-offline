@@ -92,6 +92,28 @@ namespace Server.CustomBots
         // recovery cannot be forgotten.
         public static event Action<PlayerBot> RosterBotDeleted;
 
+        // Headless/integration observers can verify clientless delivery without
+        // changing the native chat path. The event is raised after the direct
+        // sends complete and carries the exact live sender name plus count.
+        public static event Action<string, string, string, int> GuildChatReplyDelivered;
+
+        public static int PendingGuildChatReplyCount
+        {
+            get
+            {
+                lock (LifecycleSync)
+                {
+                    return PendingChatReplies.Count;
+                }
+            }
+        }
+
+        // Diagnostics/test seam: returns a snapshot and never mutates roster
+        // state. Production callers should prefer the gump/query APIs.
+        public static IReadOnlyList<PlayerBot> GetRosterBotsForDiagnostics(
+            string guildId, string personaId = null) =>
+            FindRosterBots(guildId, personaId).ToArray();
+
         public static void OnRosterBotDeleted(PlayerBot bot)
         {
             if (bot == null)
@@ -704,6 +726,16 @@ namespace Server.CustomBots
                     $"[PlayerGuildBotRoster] guild '{guildId}' reply skipped: " +
                     "no online real members.");
             }
+
+            try
+            {
+                GuildChatReplyDelivered?.Invoke(guildId, personaId, bot.Name, sent);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] chat delivery observer failed: {ex.Message}");
+            }
         }
 
         private static IReadOnlyList<Mobile> GetGuildMembers(PlayerGuildBotGuild guild)
@@ -727,7 +759,11 @@ namespace Server.CustomBots
             member.Map != null && member.Map != Map.Internal &&
             member is not PlayerBot;
 
-        public static RosterLoadResult Reload()
+        public static RosterLoadResult Reload() => Reload(scheduleReconcile: true);
+
+        // The headless bridge uses this overload while swapping a disposable
+        // candidate so the global provider is never reconciled mid-scenario.
+        public static RosterLoadResult Reload(bool scheduleReconcile)
         {
             var errors = new List<string>();
             PlayerGuildBotRosterSnapshot candidate = null;
@@ -790,7 +826,7 @@ namespace Server.CustomBots
                         Console.WriteLine(
                             $"[PlayerGuildBotRoster] chat reload failed: {ex.Message}");
                     }
-                    if (_initialized)
+                    if (_initialized && scheduleReconcile)
                     {
                         ScheduleReconcile();
                     }

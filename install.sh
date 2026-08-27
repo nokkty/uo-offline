@@ -1319,10 +1319,11 @@ install_playerbots() {
 
   # Deploy every bot data directory present in the repo. The bots need
   # Destinations (where to go), Waypoints (the road graph), Zones (painted
-  # areas + portals for arrival), Navigation (field caches), and
-  # PlayerBotChat (speech lines). Whole-dir copy so new dirs are picked up
-  # automatically.
-  for sub in Destinations Waypoints Zones PlayerBotChat; do
+  # areas + portals for arrival), Navigation (field caches), PlayerBotChat
+  # (speech lines), and PlayerGuildBots (roster configuration). Whole-dir copy
+  # so new dirs are picked up automatically. Runtime roster-state.json is
+  # created by the server and is never part of source data.
+  for sub in Destinations Waypoints Zones PlayerBotChat PlayerGuildBots; do
     if [[ -d "${src_dir}/data/${sub}" ]]; then
       say "Deploying ${sub} -> ${DIST_DIR}/Data/${sub}"
       mkdir -p "${DIST_DIR}/Data/${sub}"

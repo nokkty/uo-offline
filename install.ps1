@@ -447,9 +447,10 @@ function InstallPlayerBots {
   Copy-Item -Recurse -Force (Join-Path $srcDir "source\CustomBots\*") $srcTarget
 
   # Deploy every bot data directory present in the repo (Destinations,
-  # Waypoints, Zones, PlayerBotChat). Navigation/fields_cache.bin is a
-  # generated cache the bots rebuild on first run — not shipped.
-  foreach ($sub in @("Destinations","Waypoints","Zones","PlayerBotChat")) {
+  # Waypoints, Zones, PlayerBotChat, PlayerGuildBots). Navigation/fields_cache.bin
+  # is a generated cache the bots rebuild on first run — not shipped. Runtime
+  # roster-state.json is created by the server and is never part of source data.
+  foreach ($sub in @("Destinations","Waypoints","Zones","PlayerBotChat","PlayerGuildBots")) {
     $from = Join-Path $srcDir "data\$sub"
     if (Test-Path $from) {
       $to = Join-Path $DistDir "Data\$sub"

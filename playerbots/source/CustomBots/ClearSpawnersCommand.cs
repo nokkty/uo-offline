@@ -44,8 +44,11 @@ namespace Server.CustomBots
             var bots = new List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot)
+                {
                     bots.Add(bot);
+                }
             }
 
             foreach (var sp in spawners)

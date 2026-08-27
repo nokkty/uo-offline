@@ -88,10 +88,10 @@ namespace Server.CustomBots
         // would go stale there and let the whole population overshoot the
         // curve.
         //
-        // Fixed-role FIXTURES (permanent bank crowds etc.) are subtracted:
-        // they're furniture, not sessions. Without this, thirty permanent
-        // sitters would silently eat thirty slots of the organic
-        // population that actually travels the world.
+        // Fixed-role FIXTURES (permanent bank crowds etc.) and player-guild
+        // roster bots are excluded: fixtures are furniture and rosters are
+        // guild companions, not ambient sessions. Without this, they silently
+        // eat slots from the organic population that actually travels the world.
         // -------------------------------------------------------------------
 
         // Live fixed-role bots right now. Maintained O(1) by PlayerBot:
@@ -107,7 +107,8 @@ namespace Server.CustomBots
             {
                 return true;
             }
-            return NamePool.InUseCount - FixedRoleCount < TargetNow;
+            return NamePool.InUseCount - FixedRoleCount -
+                   NamePool.LiveReservedCount < TargetNow;
         }
 
         private static int CountLive()
@@ -115,7 +116,8 @@ namespace Server.CustomBots
             int n = 0;
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted && bot.Map != Map.Internal)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot && bot.Map != Map.Internal)
                 {
                     n++;
                 }
@@ -133,7 +135,8 @@ namespace Server.CustomBots
             _scratch.Clear();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted && bot.Map != Map.Internal)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot && bot.Map != Map.Internal)
                 {
                     _scratch.Add(bot);
                 }
@@ -225,6 +228,8 @@ namespace Server.CustomBots
         // catch it once things calm down. Ghosts don't say "gtg", and a
         // bot mid corpse-run finishes the story before logging.
         private static bool CanLogoutNow(PlayerBot bot) =>
+            bot != null &&
+            !bot.IsPlayerGuildBot &&
             bot.Alive &&
             !bot.LoggingOut &&
             !bot.CorpseRunPending &&
@@ -248,7 +253,7 @@ namespace Server.CustomBots
             // A beat between "gtg" and vanishing, like a real logout timer.
             Timer.DelayCall(TimeSpan.FromSeconds(Utility.RandomMinMax(3, 6)), () =>
             {
-                if (!bot.Deleted)
+                if (!bot.Deleted && !bot.IsPlayerGuildBot)
                 {
                     bot.Delete();
                 }

@@ -181,7 +181,12 @@ namespace Server.CustomBots
                 }
             }
 
-            bot.Behavior = new TravelerBehavior();
+            var configured = bot.IsPlayerGuildBot
+                ? bot.ConfiguredBehaviorName
+                : null;
+            bot.Behavior = string.IsNullOrWhiteSpace(configured)
+                ? new TravelerBehavior()
+                : BehaviorRegistry.Create(configured);
         }
 
         private static int Dist(Point3D a, Point3D b)

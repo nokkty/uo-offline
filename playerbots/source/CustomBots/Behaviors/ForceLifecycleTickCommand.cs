@@ -42,7 +42,8 @@ namespace Server.CustomBots
             var snapshot = new List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted && bot.Map != Map.Internal)
+                if (m is PlayerBot bot && !bot.Deleted && !bot.IsPlayerGuildBot &&
+                    bot.Map != Map.Internal)
                 {
                     if (targetName == null ||
                         string.Equals(bot.Name, targetName, StringComparison.OrdinalIgnoreCase))

@@ -73,6 +73,7 @@ namespace Server.CustomBots
             {
                 if (mobile is PlayerBot bot &&
                     !bot.Deleted &&
+                    !bot.IsPlayerGuildBot &&
                     bot.Map != Map.Internal)
                 {
                     _scratch.Add(bot);
@@ -87,7 +88,7 @@ namespace Server.CustomBots
                 if (bot.Deleted || bot.Map == Map.Internal) continue;
 
                 // Fixed-role bots (FixedRoleBotSpawner) never transition.
-                if (bot.LifecycleExempt) continue;
+                if (bot.LifecycleExempt || bot.IsPlayerGuildBot) continue;
 
                 // Partied bots are mid-hunt — the party manager owns their
                 // behavior until the group disbands. Without this, a
@@ -177,6 +178,11 @@ namespace Server.CustomBots
         // -------------------------------------------------------------------
         internal static void AssignPersonality(PlayerBot bot)
         {
+            if (bot == null || bot.IsPlayerGuildBot)
+            {
+                return;
+            }
+
             bot.Personality = BotPersonality.RollRandom();
             bot.PhaseStartedAt = Core.Now;
             Log($"[{bot.Name}] personality assigned: {bot.Personality}");
@@ -184,6 +190,11 @@ namespace Server.CustomBots
 
         internal static void TransitionBot(PlayerBot bot)
         {
+            if (bot == null || bot.IsPlayerGuildBot)
+            {
+                return;
+            }
+
             var p = bot.Personality;
             string current = bot.Behavior?.SerializableName ?? "Idle";
             string target  = PickNextBehavior(p, current);

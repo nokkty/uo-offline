@@ -1310,7 +1310,8 @@ namespace Server.CustomBots
             var victims = new System.Collections.Generic.List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is not PlayerBot bot || bot.Deleted)
+                if (m is not PlayerBot bot || bot.Deleted ||
+                    bot.IsPlayerGuildBot)
                 {
                     continue;
                 }

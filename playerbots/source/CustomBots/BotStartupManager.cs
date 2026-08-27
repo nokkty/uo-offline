@@ -92,8 +92,11 @@ namespace Server.CustomBots
             var stale = new List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot)
+                {
                     stale.Add(bot);
+                }
             }
             foreach (var bot in stale)
             {
@@ -155,8 +158,11 @@ namespace Server.CustomBots
             int n = 0;
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot)
+                {
                     n++;
+                }
             }
             return n;
         }

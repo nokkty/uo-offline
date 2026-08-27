@@ -187,7 +187,8 @@ namespace Server.CustomBots
             var victims = new List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is not PlayerBot bot || bot.Deleted) continue;
+                if (m is not PlayerBot bot || bot.Deleted ||
+                    bot.IsPlayerGuildBot) continue;
                 if (!worldwide)
                 {
                     if (bot.Map != from.Map) continue;

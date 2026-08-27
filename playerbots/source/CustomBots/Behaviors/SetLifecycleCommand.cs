@@ -63,7 +63,8 @@ namespace Server.CustomBots
             int assigned = 0, total = 0;
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot bot && !bot.Deleted && bot.Map != Map.Internal)
+                if (m is PlayerBot bot && !bot.Deleted &&
+                    !bot.IsPlayerGuildBot && bot.Map != Map.Internal)
                 {
                     total++;
                     if (bot.Personality.IsAssigned) assigned++;

@@ -309,7 +309,8 @@ namespace Server.CustomBots
             var bots = new List<PlayerBot>();
             foreach (var m in World.Mobiles.Values)
             {
-                if (m is PlayerBot b && !b.Deleted && b.Behavior is PKBehavior)
+                if (m is PlayerBot b && !b.Deleted &&
+                    !b.IsPlayerGuildBot && b.Behavior is PKBehavior)
                 {
                     bots.Add(b);
                 }

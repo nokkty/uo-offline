@@ -279,6 +279,20 @@ namespace Server.CustomBots
             }
         }
 
+        // Names currently claimed through a persistent reservation. This is
+        // the O(1) roster portion of InUseCount used by ambient population
+        // pressure; ordinary bot claims have no live owner entry.
+        public static int LiveReservedCount
+        {
+            get
+            {
+                lock (Sync)
+                {
+                    return _liveOwners.Count;
+                }
+            }
+        }
+
         // Reserve a name for one guild/persona owner. A live name is a
         // conflict unless it is already live for the same owner.
         public static bool Reserve(string name, string ownerKey)

@@ -66,6 +66,22 @@ namespace Server.CustomBots
             }
         }
 
+        // Shared owner key for NamePool reservations and persisted state.
+        public static string GetReservationOwner(string guildId, string personaId) =>
+            MakeKey(guildId, personaId);
+
+        // T2 provides the deletion seam; T3 subscribes the reconciliation
+        // manager to recreate active identities after targeted deletion.
+        public static event Action<PlayerBot> RosterBotDeleted;
+
+        public static void OnRosterBotDeleted(PlayerBot bot)
+        {
+            if (bot != null)
+            {
+                RosterBotDeleted?.Invoke(bot);
+            }
+        }
+
         // A corrupt state file must not silently generate replacement names.
         // The manager leaves affected identities offline until the file is
         // repaired or deliberately removed by an operator.

@@ -244,26 +244,216 @@ namespace Server.CustomBots
             "the Unlucky", "the Lame", "the Pious", "the Black"
         };
 
-        // ---- Live-name registry ----
+        // ---- Live names and persistent roster reservations --------------
         //
-        // Names currently walking the world. Claim on bot creation,
-        // release on bot delete. Case-insensitive so "Bob" blocks "bob".
+        // Names currently walking the world live in _inUse. Roster names are
+        // also reserved while their transient bot is absent, so ordinary
+        // bots cannot consume an identity that must return later.
+        private static readonly object Sync = new();
         private static readonly HashSet<string> _inUse =
             new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, string> _reservations =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, string> _liveOwners =
+            new(StringComparer.OrdinalIgnoreCase);
 
-        public static int InUseCount => _inUse.Count;
+        public static int InUseCount
+        {
+            get
+            {
+                lock (Sync)
+                {
+                    return _inUse.Count;
+                }
+            }
+        }
 
-        // Register a name as live. Returns false if already taken.
-        public static bool Claim(string name) =>
-            !string.IsNullOrEmpty(name) && _inUse.Add(name);
+        public static int ReservedCount
+        {
+            get
+            {
+                lock (Sync)
+                {
+                    return _reservations.Count;
+                }
+            }
+        }
+
+        // Reserve a name for one guild/persona owner. A live name is a
+        // conflict unless it is already live for the same owner.
+        public static bool Reserve(string name, string ownerKey)
+        {
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ownerKey))
+            {
+                return false;
+            }
+
+            name = name.Trim();
+            ownerKey = ownerKey.Trim();
+            lock (Sync)
+            {
+                if (_reservations.TryGetValue(name, out var currentOwner))
+                {
+                    return string.Equals(currentOwner, ownerKey,
+                        StringComparison.OrdinalIgnoreCase) &&
+                        (!_inUse.Contains(name) || IsLiveOwner(name, ownerKey));
+                }
+                if (_inUse.Contains(name))
+                {
+                    return false;
+                }
+
+                _reservations[name] = ownerKey;
+                return true;
+            }
+        }
+
+        // Claim a name that is reserved by this exact owner. Ordinary Claim
+        // callers cannot use reserved names.
+        public static bool ClaimReserved(string name, string ownerKey)
+        {
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ownerKey))
+            {
+                return false;
+            }
+
+            name = name.Trim();
+            ownerKey = ownerKey.Trim();
+            lock (Sync)
+            {
+                if (!_reservations.TryGetValue(name, out var reservedOwner) ||
+                    !string.Equals(reservedOwner, ownerKey,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+                if (_inUse.Contains(name))
+                {
+                    return IsLiveOwner(name, ownerKey);
+                }
+
+                _inUse.Add(name);
+                _liveOwners[name] = ownerKey;
+                return true;
+            }
+        }
+
+        public static bool IsReserved(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return false;
+            }
+            lock (Sync)
+            {
+                return _reservations.ContainsKey(name.Trim());
+            }
+        }
+
+        public static bool ReleaseReservation(string name, string ownerKey)
+        {
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ownerKey))
+            {
+                return false;
+            }
+
+            lock (Sync)
+            {
+                if (!_reservations.TryGetValue(name.Trim(), out var currentOwner) ||
+                    !string.Equals(currentOwner, ownerKey.Trim(),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+                _reservations.Remove(name.Trim());
+                return true;
+            }
+        }
+
+        public static int ReleaseReservationsForOwner(string ownerKey)
+        {
+            if (string.IsNullOrWhiteSpace(ownerKey))
+            {
+                return 0;
+            }
+
+            lock (Sync)
+            {
+                var names = new List<string>();
+                foreach (var pair in _reservations)
+                {
+                    if (string.Equals(pair.Value, ownerKey.Trim(),
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        names.Add(pair.Key);
+                    }
+                }
+                foreach (var name in names)
+                {
+                    _reservations.Remove(name);
+                }
+                return names.Count;
+            }
+        }
+
+        // Register a normal bot name as live. Reserved names are unavailable
+        // to this path, so PickUnique never consumes a roster identity.
+        public static bool Claim(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return false;
+            }
+
+            lock (Sync)
+            {
+                name = name.Trim();
+                if (_reservations.ContainsKey(name))
+                {
+                    return false;
+                }
+                return _inUse.Add(name);
+            }
+        }
+
+        // Loaded ordinary bots already have a serialized name. Track a
+        // reserved-name collision so a roster owner cannot create a duplicate
+        // while that legacy bot is still alive; the caller can report/repair
+        // the conflict without silently renaming it.
+        public static bool ClaimLoaded(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return false;
+            }
+
+            lock (Sync)
+            {
+                name = name.Trim();
+                bool reserved = _reservations.ContainsKey(name);
+                bool claimed = _inUse.Add(name);
+                return !reserved && claimed;
+            }
+        }
 
         public static void Release(string name)
         {
-            if (!string.IsNullOrEmpty(name))
+            if (string.IsNullOrWhiteSpace(name))
             {
+                return;
+            }
+
+            lock (Sync)
+            {
+                name = name.Trim();
                 _inUse.Remove(name);
+                _liveOwners.Remove(name);
             }
         }
+
+        private static bool IsLiveOwner(string name, string ownerKey) =>
+            _liveOwners.TryGetValue(name, out var liveOwner) &&
+            string.Equals(liveOwner, ownerKey, StringComparison.OrdinalIgnoreCase);
 
         // -------------------------------------------------------------------
         // PickUnique — roll a name no live bot is using, and claim it.
@@ -314,8 +504,18 @@ namespace Server.CustomBots
                 }
             }
 
-            // Should never get here; accept a duplicate over failing.
-            return PickRandom(female);
+            // The normal pools should never exhaust, but keep the final
+            // fallback inside Claim so it still respects reservations.
+            for (int i = 0; ; i++)
+            {
+                var name = i < 1000
+                    ? PickRandom(female)
+                    : $"{Generate(female)} {i}";
+                if (Claim(name))
+                {
+                    return name;
+                }
+            }
         }
 
         private static string RollBase(bool female)

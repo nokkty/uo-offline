@@ -29,6 +29,17 @@ namespace Server.CustomBots
     {
         public bool IsBot { get; set; } = true;
 
+        // ---- Real player-guild roster identity ---------------------------
+        //
+        // Roster bots are transient. The manager's state file is the source
+        // of persistence; these fields only identify the live replacement and
+        // are deliberately not added to PlayerBot serialization.
+        public bool IsPlayerGuildBot;
+        public string PlayerGuildId;
+        public string PlayerGuildPersonaId;
+        public string PlayerGuildReservationOwner;
+        public string ConfiguredBehaviorName;
+
         // -------------------------------------------------------------------
         // Note on speech color:
         // Mobile.SpeechHue (inherited) is what overhead chat actually uses.
@@ -335,6 +346,111 @@ namespace Server.CustomBots
             Behavior = new IdleBehavior();
         }
 
+        // Build a roster bot from an already-reserved exact name. The normal
+        // constructor still supplies all ordinary PlayerBot setup; its random
+        // name and synthetic guild membership are replaced before placement.
+        public static PlayerBot CreatePlayerGuildBot(
+            string exactName,
+            bool female,
+            BotClass cls,
+            BotSkillTier tier,
+            string behaviorName,
+            string homeCity,
+            string guildId,
+            string personaId)
+        {
+            if (string.IsNullOrWhiteSpace(exactName) ||
+                string.IsNullOrWhiteSpace(behaviorName) ||
+                string.IsNullOrWhiteSpace(homeCity) ||
+                string.IsNullOrWhiteSpace(guildId) ||
+                string.IsNullOrWhiteSpace(personaId))
+            {
+                return null;
+            }
+
+            exactName = exactName.Trim();
+            behaviorName = behaviorName.Trim();
+            guildId = guildId.Trim();
+            personaId = personaId.Trim();
+            homeCity = homeCity.Trim();
+
+            if (IsRealPlayerNameInUse(exactName))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] name conflict for guild '{guildId}' " +
+                    $"persona '{personaId}': '{exactName}' is used by a player.");
+                return null;
+            }
+
+            var ownerKey = PlayerGuildBotRoster.GetReservationOwner(guildId, personaId);
+            if (ownerKey == null || !NamePool.ClaimReserved(exactName, ownerKey))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] name conflict for guild '{guildId}' " +
+                    $"persona '{personaId}': '{exactName}' is unavailable or not reserved " +
+                    "for this owner.");
+                return null;
+            }
+
+            PlayerBot bot = null;
+            try
+            {
+                bot = new PlayerBot(cls, tier);
+                NamePool.Release(bot.Name); // release the constructor's random name
+
+                bot.Name = exactName;
+                bot.Female = female;
+                bot.Body = female ? 0x191 : 0x190;
+                bot.Class = cls;
+                bot.SkillTier = tier;
+                bot.BotGuildIndex = -1;
+                bot.HomeCity = homeCity;
+                bot.PlayerGuildId = guildId;
+                bot.PlayerGuildPersonaId = personaId;
+                bot.PlayerGuildReservationOwner = ownerKey;
+                bot.ConfiguredBehaviorName = behaviorName;
+                bot.LifecycleExempt = false;
+
+                // Rebuild skills and equipment for the configured class after
+                // the ordinary constructor's random class roll.
+                bot.ReinitializeAsClass(cls);
+                if (cls == BotClass.Mage)
+                {
+                    EquipmentTable.EquipTankMageWeapon(bot, tier);
+                }
+                bot.Behavior = BehaviorRegistry.Create(behaviorName);
+                bot.IsPlayerGuildBot = true;
+                return bot;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] failed to initialize '{exactName}': " +
+                    ex.Message);
+                if (bot != null)
+                {
+                    bot.IsPlayerGuildBot = false;
+                    try { bot.Delete(); } catch { }
+                }
+                NamePool.Release(exactName);
+                return null;
+            }
+        }
+
+        private static bool IsRealPlayerNameInUse(string name)
+        {
+            foreach (var mobile in World.Mobiles.Values)
+            {
+                if (mobile is PlayerMobile && mobile is not PlayerBot &&
+                    !mobile.Deleted && string.Equals(mobile.Name, name,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         // -------------------------------------------------------------------
         // Apply this bot's skill template based on Class and SkillTier.
         // Primary skill gets PrimarySkillTarget(tier) + jitter. Secondaries
@@ -551,12 +667,15 @@ namespace Server.CustomBots
         // -------------------------------------------------------------------
         public override string ApplyNameSuffix(string suffix)
         {
-            var guild = BotGuilds.Get(BotGuildIndex);
-            if (guild != null)
+            if (!IsPlayerGuildBot)
             {
-                suffix = string.IsNullOrWhiteSpace(suffix)
-                    ? $"[{guild.Tag}]"
-                    : $"{suffix} [{guild.Tag}]";
+                var guild = BotGuilds.Get(BotGuildIndex);
+                if (guild != null)
+                {
+                    suffix = string.IsNullOrWhiteSpace(suffix)
+                        ? $"[{guild.Tag}]"
+                        : $"{suffix} [{guild.Tag}]";
+                }
             }
             return base.ApplyNameSuffix(suffix);
         }
@@ -812,6 +931,10 @@ namespace Server.CustomBots
                 BotSessionManager.FixedRoleCount--;
             }
             NamePool.Release(Name);
+            if (IsPlayerGuildBot)
+            {
+                PlayerGuildBotRoster.OnRosterBotDeleted(this);
+            }
             base.OnAfterDelete();
         }
 
@@ -939,6 +1062,14 @@ namespace Server.CustomBots
         {
             base.Deserialize(reader);
 
+            // Roster identity is runtime-only. Legacy and ordinary bot saves
+            // always load as non-roster bots with no native guild identity.
+            IsPlayerGuildBot = false;
+            PlayerGuildId = null;
+            PlayerGuildPersonaId = null;
+            PlayerGuildReservationOwner = null;
+            ConfiguredBehaviorName = null;
+
             int version = reader.ReadInt();
 
             string behaviorName = "Idle";
@@ -1025,9 +1156,9 @@ namespace Server.CustomBots
             Thirst = 20;
 
             // Register the loaded name so fresh spawns can't duplicate it.
-            // (Loaded bots are normally purged at startup anyway, but the
-            // claim keeps the registry honest for however long they live.)
-            NamePool.Claim(Name);
+            // ClaimLoaded also tracks a reserved-name collision instead of
+            // letting an ordinary legacy bot race a roster owner.
+            NamePool.ClaimLoaded(Name);
 
             // Note: no manual Title set. The paperdoll renders the title
             // from the bot's highest skill above 50 (UO's normal behavior).

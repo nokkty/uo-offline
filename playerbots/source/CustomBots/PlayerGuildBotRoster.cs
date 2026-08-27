@@ -13,6 +13,7 @@ using System.Text;
 using System.Text.Json;
 using Server;
 using Server.Commands;
+using Server.Gumps;
 
 namespace Server.CustomBots
 {

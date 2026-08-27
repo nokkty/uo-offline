@@ -11,3 +11,5 @@ patch_readme_dual.py
 uoico.ico
 __pycache__/
 tools/map/walk_atlas.pgm
+/.pi
+/.ai

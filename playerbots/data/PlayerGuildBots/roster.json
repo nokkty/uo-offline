@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "nameFormat": "{BaseName} of {GuildTag}",
+  "spawnRadius": 12,
+  "personas": [
+    {
+      "id": "captain",
+      "baseName": "Aldric",
+      "female": false,
+      "class": "Warrior",
+      "skillTier": "Master",
+      "behavior": "Adventurer",
+      "chatCategories": ["guild_chat"]
+    },
+    {
+      "id": "scout",
+      "baseName": "Lyra",
+      "female": true,
+      "class": "Ranger",
+      "skillTier": "Expert",
+      "behavior": "Traveler",
+      "chatCategories": ["guild_chat"]
+    },
+    {
+      "id": "mage",
+      "baseName": "Elara",
+      "female": true,
+      "class": "Mage",
+      "skillTier": "Expert",
+      "behavior": "Adventurer",
+      "chatCategories": ["guild_chat"]
+    },
+    {
+      "id": "healer",
+      "baseName": "Mara",
+      "female": true,
+      "class": "Healer",
+      "skillTier": "Master",
+      "behavior": "Visitor",
+      "chatCategories": ["guild_chat"]
+    },
+    {
+      "id": "quartermaster",
+      "baseName": "Orin",
+      "female": false,
+      "class": "Merchant",
+      "skillTier": "Journeyman",
+      "behavior": "BankSitter",
+      "chatCategories": ["guild_chat"]
+    }
+  ]
+}

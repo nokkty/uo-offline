@@ -1,0 +1,151 @@
+diff --git a/Projects/UOContent/Gumps/Guilds/New Guild System/CreateGuildGump.cs b/Projects/UOContent/Gumps/Guilds/New Guild System/CreateGuildGump.cs
+index 21d49b365..71d9c10a3 100644
+--- a/Projects/UOContent/Gumps/Guilds/New Guild System/CreateGuildGump.cs	
++++ b/Projects/UOContent/Gumps/Guilds/New Guild System/CreateGuildGump.cs	
+@@ -1,3 +1,4 @@
++using Server.CustomBots;
+ using Server.Gumps;
+ using Server.Mobiles;
+ using Server.Network;
+@@ -106,7 +107,9 @@ public override void OnResponse(NetState sender, in RelayInfo info)
+                             pm.SendLocalizedMessage(1060398, Guild.RegistrationFee.ToString());
+ 
+                             pm.SendLocalizedMessage(1063238); // Your new guild has been founded.
+-                            pm.Guild = new Guild(pm, guildName, guildAbbrev);
++                            var guild = new Guild(pm, guildName, guildAbbrev);
++                            pm.Guild = guild;
++                            PlayerGuildBotRoster.OnGuildCreated(guild);
+                         }
+ 
+                         break;
+diff --git a/Projects/UOContent/Items/Guilds/GuildDeed.cs b/Projects/UOContent/Items/Guilds/GuildDeed.cs
+index 1c1d6f61a..d3e83f9ee 100644
+--- a/Projects/UOContent/Items/Guilds/GuildDeed.cs
++++ b/Projects/UOContent/Items/Guilds/GuildDeed.cs
+@@ -1,4 +1,5 @@
+ using ModernUO.Serialization;
++using Server.CustomBots;
+ using Server.Guilds;
+ using Server.Multis;
+ using Server.Prompts;
+@@ -112,6 +113,7 @@ public override void OnResponse(Mobile from, string text)
+                     stone.MoveToWorld(from.Location, from.Map);
+ 
+                     guild.Guildstone = stone;
++                    PlayerGuildBotRoster.OnGuildCreated(guild);
+                 }
+             }
+         }
+diff --git a/Projects/UOContent/Misc/Guild.cs b/Projects/UOContent/Misc/Guild.cs
+index 88ec44773..caef9d4e8 100644
+--- a/Projects/UOContent/Misc/Guild.cs
++++ b/Projects/UOContent/Misc/Guild.cs
+@@ -2,6 +2,7 @@
+ using System.Collections.Generic;
+ using System.Runtime.InteropServices;
+ using Server.Commands.Generic;
++using Server.CustomBots;
+ using Server.Gumps;
+ using Server.Items;
+ using Server.Mobiles;
+@@ -817,7 +818,15 @@ public void Disband()
+ 
+             foreach (var m in Members)
+             {
+-                m.SendLocalizedMessage(502131); // Your guild has disbanded.
++                if (m == null)
++                {
++                    continue;
++                }
++
++                if (m.NetState != null)
++                {
++                    m.SendLocalizedMessage(502131); // Your guild has disbanded.
++                }
+ 
+                 if (m is PlayerMobile mobile)
+                 {
+@@ -855,6 +864,7 @@ public void Disband()
+             CheckExpiredWars();
+ 
+             Alliance = null;
++            PlayerGuildBotRoster.OnGuildDisbanded(Serial.ToString());
+         }
+ 
+         [Usage("GuildProps"), Description(
+@@ -1344,7 +1354,7 @@ public void AddMember(Mobile m)
+                 pm.GuildRank = RankDefinition.Lowest;
+             }
+ 
+-            if (message > 0)
++            if (message > 0 && m.NetState != null)
+             {
+                 m.SendLocalizedMessage(message);
+             }
+@@ -1409,7 +1419,11 @@ public void GuildMessage(int number)
+         {
+             for (var i = 0; i < Members.Count; ++i)
+             {
+-                Members[i].SendLocalizedMessage(number);
++                var member = Members[i];
++                if (member?.NetState != null)
++                {
++                    member.SendLocalizedMessage(number);
++                }
+             }
+         }
+ 
+@@ -1417,7 +1431,11 @@ public void GuildMessage(int number, string args, int hue = 0x3B2)
+         {
+             for (var i = 0; i < Members.Count; ++i)
+             {
+-                Members[i].SendLocalizedMessage(number, args, hue);
++                var member = Members[i];
++                if (member?.NetState != null)
++                {
++                    member.SendLocalizedMessage(number, args, hue);
++                }
+             }
+         }
+ 
+@@ -1425,7 +1443,11 @@ public void GuildMessage(int number, bool append, string affix, string args = ""
+         {
+             for (var i = 0; i < Members.Count; ++i)
+             {
+-                Members[i].SendLocalizedMessage(number, append, affix, args, hue);
++                var member = Members[i];
++                if (member?.NetState != null)
++                {
++                    member.SendLocalizedMessage(number, append, affix, args, hue);
++                }
+             }
+         }
+ 
+@@ -1435,7 +1457,11 @@ public void GuildTextMessage(int hue, string text)
+         {
+             for (var i = 0; i < Members.Count; ++i)
+             {
+-                Members[i].SendMessage(hue, text);
++                var member = Members[i];
++                if (member?.NetState != null)
++                {
++                    member.SendMessage(hue, text);
++                }
+             }
+         }
+ 
+@@ -1457,6 +1483,14 @@ public void GuildChat(Mobile from, int hue, string text)
+ 
+                 Members[i].NetState?.Send(buffer);
+             }
++
++            // Feed real player guild speech into the roster responder. Bot
++            // speakers are ignored by HandleGuildMessage, preventing loops.
++            if (from?.Guild == this &&
++                PlayerGuildBotRoster.TryGetGuildForMember(from, out var rosterGuild))
++            {
++                PlayerGuildBotRoster.HandleGuildMessage(rosterGuild.Id, from, text);
++            }
+         }
+ 
+         public void GuildChat(Mobile from, string text)

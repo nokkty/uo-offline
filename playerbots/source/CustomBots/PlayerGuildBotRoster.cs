@@ -15,6 +15,7 @@ using Server;
 using Server.Commands;
 using Server.Guilds;
 using Server.Gumps;
+using Server.Mobiles;
 
 namespace Server.CustomBots
 {
@@ -180,9 +181,22 @@ namespace Server.CustomBots
         public static void Configure()
         {
             CommandSystem.Register("GuildBots", AccessLevel.Player, OnCommand);
+            GuildProvider = GetNativeGuilds;
             LoadState();
             Reload();
         }
+
+        private static IReadOnlyList<PlayerGuildBotGuild> GetNativeGuilds() =>
+            World.Guilds.Values
+                .OfType<Guild>()
+                .Where(guild => guild?.Disbanded == false && guild.Members != null &&
+                    guild.Members.Any(member => member is PlayerMobile &&
+                        member is not PlayerBot && !member.Deleted))
+                .Select(guild => new PlayerGuildBotGuild(
+                    guild.Serial.ToString(), guild.Abbreviation,
+                    memberProvider: () => guild.Members,
+                    nativeGuild: guild))
+                .ToArray();
 
         [Usage("GuildBots roster [guildId] | reload")]
         [Description("View player-guild bot rosters or reload roster data (administrator only).")]
@@ -408,7 +422,8 @@ namespace Server.CustomBots
             OnGuildCreated(new PlayerGuildBotGuild(
                 guild.Serial.ToString(),
                 guild.Abbreviation,
-                memberProvider: () => guild.Members));
+                memberProvider: () => guild.Members,
+                nativeGuild: guild));
         }
 
         public static void OnGuildCreated(
@@ -427,11 +442,12 @@ namespace Server.CustomBots
 
             lock (LifecycleSync)
             {
-                ActiveGuilds[normalized.Id] = normalized;
-                if (!GuildGenerations.ContainsKey(normalized.Id))
+                if (!ActiveGuilds.ContainsKey(normalized.Id))
                 {
-                    GuildGenerations[normalized.Id] = 0;
+                    GuildGenerations[normalized.Id] = GuildGenerations.TryGetValue(
+                        normalized.Id, out var generation) ? generation + 1 : 0;
                 }
+                ActiveGuilds[normalized.Id] = normalized;
             }
             ReconcileGuild(normalized);
         }
@@ -701,7 +717,9 @@ namespace Server.CustomBots
 
             var bot = FindRosterBots(guildId, personaId)
                 .FirstOrDefault(IsOnlineRosterBot);
-            if (bot == null)
+            if (bot == null || guild.NativeGuild != null &&
+                (bot.Guild != guild.NativeGuild ||
+                    !guild.NativeGuild.Members.Contains(bot)))
             {
                 return;
             }
@@ -714,24 +732,33 @@ namespace Server.CustomBots
 
             var recipients = GetGuildMembers(guild);
             int sent = 0;
-            foreach (var member in recipients)
+            if (guild.NativeGuild != null)
             {
-                if (!IsOnlineRealMember(member))
+                // Use the native packet path so clients render this as
+                // [Guild][BotName], not as an unrelated system message.
+                guild.NativeGuild.GuildChat(bot, line);
+                sent = recipients.Count(IsOnlineRealMember);
+            }
+            else
+            {
+                foreach (var member in recipients)
                 {
-                    continue;
-                }
-                try
-                {
-                    // Mobile.SendMessage handles transport details for a real
-                    // member; this path never reads a bot NetState.
-                    member.SendMessage(0x3B2, $"{bot.Name}: {line}");
-                    sent++;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(
-                        $"[PlayerGuildBotRoster] guild '{guildId}' reply delivery " +
-                        $"to '{member.Name}' failed: {ex.Message}");
+                    if (!IsOnlineRealMember(member))
+                    {
+                        continue;
+                    }
+                    try
+                    {
+                        // Adapter fallback for pre-native guild integrations.
+                        member.SendMessage(0x3B2, $"{bot.Name}: {line}");
+                        sent++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"[PlayerGuildBotRoster] guild '{guildId}' reply delivery " +
+                            $"to '{member.Name}' failed: {ex.Message}");
+                    }
                 }
             }
 
@@ -992,6 +1019,13 @@ namespace Server.CustomBots
                         $"could not reserve live name '{binding.ExactName}'.");
                     return false;
                 }
+                if (!EnsureNativeMembership(guild, live))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        "live bot could not be attached to native membership.");
+                    return false;
+                }
                 return true;
             }
 
@@ -1033,6 +1067,15 @@ namespace Server.CustomBots
                 return false;
             }
 
+            if (!EnsureNativeMembership(guild, bot))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                    "skipped: native guild membership attachment failed.");
+                DeleteRosterBot(bot);
+                return false;
+            }
+
             if (!TryFindSpawnPoint(snapshot.SpawnRadius, bot, out var point))
             {
                 Console.WriteLine(
@@ -1058,6 +1101,38 @@ namespace Server.CustomBots
                     $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
                     $"placement failed: {ex.Message}");
                 DeleteRosterBot(bot);
+                return false;
+            }
+        }
+
+        private static bool EnsureNativeMembership(
+            PlayerGuildBotGuild guild, PlayerBot bot)
+        {
+            var native = guild?.NativeGuild;
+            if (native == null)
+            {
+                return true;
+            }
+
+            if (bot?.Deleted != false || native.Disbanded || native.Members == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (bot.Guild != native || !native.Members.Contains(bot))
+                {
+                    native.AddMember(bot);
+                }
+
+                return bot.Guild == native && native.Members.Contains(bot);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] native guild '{guild.Id}' membership " +
+                    $"attach failed for '{bot.Name}': {ex.Message}");
                 return false;
             }
         }
@@ -1268,7 +1343,8 @@ namespace Server.CustomBots
             }
             normalized = new PlayerGuildBotGuild(
                 guild.Id.Trim(), guild.Tag.Trim(), isActive: true,
-                memberProvider: guild.MemberProvider, members: guild.Members);
+                memberProvider: guild.MemberProvider, members: guild.Members,
+                nativeGuild: guild.NativeGuild);
             return true;
         }
 
@@ -1907,13 +1983,15 @@ namespace Server.CustomBots
             string tag,
             bool isActive = true,
             Func<IReadOnlyList<Mobile>> memberProvider = null,
-            IReadOnlyList<Mobile> members = null)
+            IReadOnlyList<Mobile> members = null,
+            Guild nativeGuild = null)
         {
             Id = id;
             Tag = tag;
             IsActive = isActive;
             MemberProvider = memberProvider;
             Members = members;
+            NativeGuild = nativeGuild;
         }
 
         public string Id { get; }
@@ -1921,6 +1999,7 @@ namespace Server.CustomBots
         public bool IsActive { get; }
         public Func<IReadOnlyList<Mobile>> MemberProvider { get; }
         public IReadOnlyList<Mobile> Members { get; }
+        public Guild NativeGuild { get; }
     }
 
     internal sealed class ChatResponder

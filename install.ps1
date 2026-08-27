@@ -394,14 +394,14 @@ function FetchModernUO {
 # ---------------------------------------------------------------------------
 # Engine patches.
 #
-# Two stock ModernUO files need a small change for the bots to work
-# properly, and they cannot live in CustomBots/ because they ARE engine
-# files. They ship as unified diffs under patches/ and go on with
-# git apply, which every install already has because it clones ModernUO.
+# Stock ModernUO files need small compatibility changes for the bots to
+# work properly, and they cannot live in CustomBots/ because they ARE engine
+# files. They ship as unified diffs under patches/ and go on with git apply,
+# which every install already has because it clones ModernUO.
 #
 # Never fatal. An upstream that has moved on will refuse a patch, and a
-# shard missing them still runs - it just loses bot housing across
-# restarts. INTEGRATION-NOTES.txt describes both by hand.
+# shard missing one still runs with the affected compatibility behavior
+# disabled. INTEGRATION-NOTES.txt describes each patch by hand.
 # ---------------------------------------------------------------------------
 function ApplyEnginePatches {
   Banner "Applying engine patches"

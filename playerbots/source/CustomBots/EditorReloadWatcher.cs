@@ -22,6 +22,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using Server;
+using Server.Guilds;
+using Server.Mobiles;
 
 namespace Server.CustomBots
 {
@@ -1330,6 +1332,7 @@ namespace Server.CustomBots
             private string _originalRoster;
             private PlayerGuildBotRosterSnapshot _initialSnapshot;
             private PlayerGuildBotGuild _guild;
+            private Guild _nativeGuild;
             private Server.Mobiles.PlayerMobile _member;
             private PlayerBot _partyBot;
             private int _baselineReservations;
@@ -1381,8 +1384,11 @@ namespace Server.CustomBots
                     };
                     var loc = TestLocation();
                     _member.MoveToWorld(loc, Map.Felucca);
+                    _nativeGuild = new Guild(_member, "GuildBots Headless", _testGuildTag);
                     _guild = new PlayerGuildBotGuild(
-                        TestGuildId, _testGuildTag, members: new Mobile[] { _member });
+                        TestGuildId, _testGuildTag,
+                        memberProvider: () => _nativeGuild.Members,
+                        nativeGuild: _nativeGuild);
 
                     PlayerGuildBotRoster.OnGuildCreated(_guild);
                     AssertRoster(_initialSnapshot, "reconcile.create");
@@ -1393,6 +1399,7 @@ namespace Server.CustomBots
                     Check(CountBots() == _initialSnapshot.Personas.Count,
                         "reconcile.onePerPersona", "one live bot exists per configured persona");
 
+                    CheckNativeGuildNotifications();
                     CheckAmbientAndSyntheticBoundaries();
                     StartDeletionCheck();
                 }
@@ -1463,12 +1470,16 @@ namespace Server.CustomBots
                             TestGuildId, botSpeaker, "bot speech"),
                         "chat.botSpeakerIgnored", "bot-generated speech cannot trigger a roster reply");
                     _firstChatStarted = DateTime.UtcNow;
-                    _firstChatAccepted = PlayerGuildBotRoster.HandleGuildMessage(
-                        TestGuildId, _member, "hello roster");
+                    // Exercise the actual native speech path. GuildChat must
+                    // feed real player speech into HandleGuildMessage; calling
+                    // the responder directly would miss that integration bug.
+                    _nativeGuild.GuildChat(_member, "hello roster");
+                    _firstChatAccepted =
+                        PlayerGuildBotRoster.PendingGuildChatReplyCount > 0;
                     bool duplicate = PlayerGuildBotRoster.HandleGuildMessage(
                         TestGuildId, _member, "hello again");
-                    Check(_firstChatAccepted, "chat.firstAccepted",
-                        "a configured online roster can schedule a guild reply");
+                    Check(_firstChatAccepted, "chat.nativePath",
+                        "native GuildChat forwards player speech to the roster responder");
                     Check(!duplicate, "chat.atMostOne",
                         "a guild has at most one pending reply at a time");
                     Timer.DelayCall(TimeSpan.FromSeconds(7), AfterFirstChat);
@@ -1837,6 +1848,41 @@ namespace Server.CustomBots
                 return false;
             }
 
+            private void CheckNativeGuildNotifications()
+            {
+                try
+                {
+                    var bot = PlayerGuildBotRoster.GetRosterBotsForDiagnostics(
+                        TestGuildId, _initialSnapshot.Personas[0].Id).FirstOrDefault();
+                    Check(bot != null && ReferenceEquals(bot.Guild, _nativeGuild) &&
+                            _nativeGuild.Members.Count(member => ReferenceEquals(member, bot)) == 1,
+                        "native.membership", "fresh roster bot is a native guild member exactly once");
+                    Check(bot is PlayerMobile &&
+                            _nativeGuild.Members.OfType<PlayerMobile>().Contains(bot),
+                        "native.rosterVisibility", "native guild roster can enumerate the bot as a PlayerMobile");
+                    Check(bot != null && Notoriety.Compute(_member, bot) == Notoriety.Ally &&
+                            Notoriety.GetHue(Notoriety.Compute(_member, bot)) == 0x3F,
+                        "native.notoriety", "guild member computes as green ally notoriety");
+                    _nativeGuild.GuildTextMessage(0x3B2, "headless native notification");
+                    _nativeGuild.GuildMessage(1063238);
+                    Check(true, "native.nullClientNotifications",
+                        "native guild notifications tolerate accountless roster members");
+
+                    _nativeGuild.RemoveMember(bot, 0);
+                    Check(!ReferenceEquals(bot.Guild, _nativeGuild) &&
+                            !_nativeGuild.Members.Contains(bot),
+                        "native.memberRemoval", "native member removal clears the bot association");
+                    PlayerGuildBotRoster.OnGuildCreated(_guild);
+                    Check(ReferenceEquals(bot.Guild, _nativeGuild) &&
+                            _nativeGuild.Members.Count(member => ReferenceEquals(member, bot)) == 1,
+                        "native.memberRepair", "reconciliation repairs removed native membership");
+                }
+                catch (Exception ex)
+                {
+                    Fail("native.nullClientNotifications", ex);
+                }
+            }
+
             private void AssertRoster(PlayerGuildBotRosterSnapshot snapshot, string prefix)
             {
                 int total = 0;
@@ -1864,6 +1910,13 @@ namespace Server.CustomBots
                                 StringComparison.OrdinalIgnoreCase),
                         $"{prefix}.identity.{persona.Id}",
                         "name, gender, class, tier, behavior, and home city match state/config");
+                    if (_nativeGuild != null)
+                    {
+                        Check(ReferenceEquals(bot.Guild, _nativeGuild) &&
+                                _nativeGuild.Members.Count(member => ReferenceEquals(member, bot)) == 1,
+                            $"{prefix}.nativeMember.{persona.Id}",
+                            "roster bot is attached to the native guild exactly once");
+                    }
                     if (!string.IsNullOrWhiteSpace(persona.HomeCity))
                     {
                         Check(string.Equals(binding.HomeCity, persona.HomeCity,
@@ -1965,6 +2018,10 @@ namespace Server.CustomBots
                 try
                 {
                     PlayerGuildBotRoster.GuildChatReplyDelivered -= OnChatDelivery;
+                    if (_nativeGuild?.Disbanded == false)
+                    {
+                        _nativeGuild.Disband();
+                    }
                     if (_member?.Party is Server.Engines.PartySystem.Party party)
                     {
                         party.Disband();

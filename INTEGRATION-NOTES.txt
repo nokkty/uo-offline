@@ -102,3 +102,38 @@ expansion config). Startup confirms it with:
 
 The moongate patch above is kept regardless -- it is the safety net for
 any ruleset that filters a player's facet list down to nothing.
+
+Stock-file patch: native guild membership for player-guild roster bots
+-----------------------------------------------------------------------
+Player-guild roster bots are accountless `PlayerBot` mobiles, but they must
+participate in the native guild system so same-guild notoriety is Ally (green)
+and the native guild roster sees them. The checked-out ModernUO version has
+no guild lifecycle events and several guild notification methods assume every
+member has a client connection, so patch `0004-player-guild-lifecycle-hooks.patch`
+modifies three stock files:
+
+  Projects/UOContent/Gumps/Guilds/New Guild System/CreateGuildGump.cs
+    Calls `PlayerGuildBotRoster.OnGuildCreated` after successful native guild
+    creation.
+
+  Projects/UOContent/Items/Guilds/GuildDeed.cs
+    Calls the same callback after successful legacy deed guild creation.
+
+  Projects/UOContent/Misc/Guild.cs
+    Calls `PlayerGuildBotRoster.OnGuildDisbanded` after native disband cleanup,
+    skips notification sends for members whose `NetState` is null, and forwards
+    real-player `GuildChat` speech into the roster responder. Connected real
+    members receive the same messages as before; accountless roster members
+    cannot receive packets and are safely ignored. Bot replies use this same
+    native guild packet path, rendering as `[Guild][BotName]: ...`.
+
+The custom `PlayerGuildBotRoster` source registers the active native-guild
+provider, attaches/reconciles bots with `Guild.AddMember`, and verifies both
+`Mobile.Guild` and `Guild.Members`. Runtime membership is transient. Startup
+purges stale serialized `PlayerBot` records before one post-load reconciliation,
+so no account or persistent bot character is created.
+
+If deploying playerbots onto a fresh ModernUO clone, apply this patch after the
+ModernUO clone and before publishing. The installer applies every `patches/*.patch`
+idempotently; if an upstream checkout moves these lines, the installer warns and
+this section is the manual repair guide.

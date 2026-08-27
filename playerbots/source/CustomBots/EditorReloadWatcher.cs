@@ -1864,6 +1864,13 @@ namespace Server.CustomBots
                                 StringComparison.OrdinalIgnoreCase),
                         $"{prefix}.identity.{persona.Id}",
                         "name, gender, class, tier, behavior, and home city match state/config");
+                    if (!string.IsNullOrWhiteSpace(persona.HomeCity))
+                    {
+                        Check(string.Equals(binding.HomeCity, persona.HomeCity,
+                                StringComparison.OrdinalIgnoreCase),
+                            $"{prefix}.homeCityOverride.{persona.Id}",
+                            $"configured home city '{persona.HomeCity}' is used for new bindings");
+                    }
                 }
                 Check(total == snapshot.Personas.Count, $"{prefix}.total",
                     $"expected {snapshot.Personas.Count} roster bots, found {total}");

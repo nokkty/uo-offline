@@ -10,6 +10,7 @@
       "class": "Warrior",
       "skillTier": "Master",
       "behavior": "Adventurer",
+      "homeCity": "Moonglow",
       "chatCategories": ["guild_chat"]
     },
     {
@@ -19,6 +20,7 @@
       "class": "Ranger",
       "skillTier": "Expert",
       "behavior": "Traveler",
+      "homeCity": "Moonglow",
       "chatCategories": ["guild_chat"]
     },
     {
@@ -28,6 +30,7 @@
       "class": "Mage",
       "skillTier": "Expert",
       "behavior": "Adventurer",
+      "homeCity": "Moonglow",
       "chatCategories": ["guild_chat"]
     },
     {
@@ -37,6 +40,7 @@
       "class": "Healer",
       "skillTier": "Master",
       "behavior": "Visitor",
+      "homeCity": "Moonglow",
       "chatCategories": ["guild_chat"]
     },
     {
@@ -46,6 +50,7 @@
       "class": "Merchant",
       "skillTier": "Journeyman",
       "behavior": "BankSitter",
+      "homeCity": "Moonglow",
       "chatCategories": ["guild_chat"]
     }
   ]

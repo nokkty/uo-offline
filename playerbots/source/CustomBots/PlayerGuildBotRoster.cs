@@ -13,6 +13,7 @@ using System.Text;
 using System.Text.Json;
 using Server;
 using Server.Commands;
+using Server.Guilds;
 using Server.Gumps;
 
 namespace Server.CustomBots
@@ -396,6 +397,19 @@ namespace Server.CustomBots
 
         public static void OnGuildCreated(string guildId, string guildTag) =>
             OnGuildCreated(new PlayerGuildBotGuild(guildId, guildTag));
+
+        public static void OnGuildCreated(Guild guild)
+        {
+            if (guild?.Disbanded != false)
+            {
+                return;
+            }
+
+            OnGuildCreated(new PlayerGuildBotGuild(
+                guild.Serial.ToString(),
+                guild.Abbreviation,
+                memberProvider: () => guild.Members));
+        }
 
         public static void OnGuildCreated(
             string guildId,
@@ -923,7 +937,7 @@ namespace Server.CustomBots
             PlayerGuildBotRosterBinding binding;
             if (!TryGetBinding(guild.Id, persona.Id, out binding))
             {
-                var homeCity = BotHomeCities.RollHome();
+                var homeCity = persona.HomeCity ?? BotHomeCities.RollHome();
                 if (string.IsNullOrWhiteSpace(homeCity))
                 {
                     Console.WriteLine(
@@ -1389,6 +1403,17 @@ namespace Server.CustomBots
                         $"Persona '{id ?? i.ToString()}' has unknown behavior '{source.Behavior}'.");
                 }
 
+                var homeCity = source.HomeCity?.Trim();
+                if (source.HomeCity != null && string.IsNullOrWhiteSpace(homeCity))
+                {
+                    errors.Add($"Persona '{id ?? i.ToString()}' has an empty 'homeCity'.");
+                }
+                else if (!string.IsNullOrWhiteSpace(homeCity) && !IsKnownHomeCity(homeCity))
+                {
+                    errors.Add(
+                        $"Persona '{id ?? i.ToString()}' has unknown home city '{homeCity}'.");
+                }
+
                 if (source.ChatCategories == null)
                 {
                     errors.Add($"Persona '{id ?? i.ToString()}' is missing 'chatCategories'.");
@@ -1424,7 +1449,7 @@ namespace Server.CustomBots
                 {
                     personas.Add(new PlayerGuildBotPersona(
                         id, baseName, source.Female.Value, botClass, skillTier,
-                        behavior, categories));
+                        behavior, categories, homeCity));
                 }
             }
 
@@ -1470,6 +1495,17 @@ namespace Server.CustomBots
                 }
             }
             return true;
+        }
+
+        private static bool IsKnownHomeCity(string city)
+        {
+            if (DestinationCatalog.Count == 0)
+            {
+                DestinationCatalog.Load();
+            }
+
+            return DestinationCatalog.All.Any(destination =>
+                string.Equals(destination.City, city, StringComparison.OrdinalIgnoreCase));
         }
 
         private static void ValidateNameFormat(string format, List<string> errors)
@@ -2033,7 +2069,8 @@ namespace Server.CustomBots
             BotClass botClass,
             BotSkillTier skillTier,
             string behavior,
-            IReadOnlyList<string> chatCategories)
+            IReadOnlyList<string> chatCategories,
+            string homeCity = null)
         {
             Id = id;
             BaseName = baseName;
@@ -2042,6 +2079,7 @@ namespace Server.CustomBots
             SkillTier = skillTier;
             Behavior = behavior;
             ChatCategories = chatCategories;
+            HomeCity = homeCity;
         }
 
         public string Id { get; }
@@ -2051,6 +2089,7 @@ namespace Server.CustomBots
         public BotSkillTier SkillTier { get; }
         public string Behavior { get; }
         public IReadOnlyList<string> ChatCategories { get; }
+        public string HomeCity { get; }
     }
 
     public sealed class PlayerGuildBotRosterState
@@ -2095,5 +2134,6 @@ namespace Server.CustomBots
         public string SkillTier { get; set; }
         public string Behavior { get; set; }
         public List<string> ChatCategories { get; set; }
+        public string HomeCity { get; set; }
     }
 }

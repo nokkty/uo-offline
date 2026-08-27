@@ -1,10 +1,8 @@
 // =========================================================================
-// PlayerGuildBotRoster.cs — configuration and persistent identity foundation
-// for transient bots attached to real player guilds.
-//
-// This file intentionally owns only the data contract and state store in T1.
-// Reconciliation, native guild hooks, chat, and commands are layered on top
-// in later implementation tasks.
+// PlayerGuildBotRoster.cs — configuration, persistent identities, and
+// idempotent lifecycle reconciliation for transient bots attached to real
+// player guilds. Native guild adapters call the public lifecycle entry points
+// defined here; no synthetic BotGuilds membership is created.
 // =========================================================================
 
 using System;
@@ -41,6 +39,20 @@ namespace Server.CustomBots
         private static PlayerGuildBotRosterState _state = NewState();
         private static bool _stateLoadHealthy = true;
 
+        private static readonly object LifecycleSync = new();
+        private static readonly Dictionary<string, PlayerGuildBotGuild> ActiveGuilds =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, long> GuildGenerations =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> PendingRecoveryKeys =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> RetiringKeys =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static Func<IReadOnlyList<PlayerGuildBotGuild>> _guildProvider;
+        private static bool _initialized;
+        private static bool _startupReconcilePending = true;
+        private static bool _reconcileScheduled;
+
         public static string ConfigurationPath => RosterPath;
         public static string StatePathForDiagnostics => StatePath;
 
@@ -70,16 +82,54 @@ namespace Server.CustomBots
         public static string GetReservationOwner(string guildId, string personaId) =>
             MakeKey(guildId, personaId);
 
-        // T2 provides the deletion seam; T3 subscribes the reconciliation
-        // manager to recreate active identities after targeted deletion.
+        // Subscribers such as later chat/admin integrations may observe a
+        // deletion, but reconciliation is owned here so targeted deletion
+        // recovery cannot be forgotten.
         public static event Action<PlayerBot> RosterBotDeleted;
 
         public static void OnRosterBotDeleted(PlayerBot bot)
         {
-            if (bot != null)
+            if (bot == null)
+            {
+                return;
+            }
+
+            try
             {
                 RosterBotDeleted?.Invoke(bot);
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] deletion observer failed: {ex.Message}");
+            }
+
+            var key = MakeKey(bot.PlayerGuildId, bot.PlayerGuildPersonaId);
+            if (key == null)
+            {
+                return;
+            }
+
+            PlayerGuildBotGuild guild;
+            long generation;
+            lock (LifecycleSync)
+            {
+                if (_startupReconcilePending ||
+                    RetiringKeys.Contains(key) ||
+                    !ActiveGuilds.TryGetValue(bot.PlayerGuildId.Trim(), out guild) ||
+                    !guild.IsActive ||
+                    !PendingRecoveryKeys.Add(key))
+                {
+                    return;
+                }
+                generation = GuildGenerations.TryGetValue(guild.Id, out var current)
+                    ? current
+                    : 0;
+            }
+
+            // Delete callbacks can fire while World.Mobiles is being
+            // enumerated. Defer one server tick and coalesce duplicate events.
+            Timer.DelayCall(TimeSpan.Zero, () => RecoverDeleted(key, generation));
         }
 
         // A corrupt state file must not silently generate replacement names.
@@ -102,6 +152,170 @@ namespace Server.CustomBots
         {
             LoadState();
             Reload();
+        }
+
+        // Native guild adapters assign a provider during their Configure pass.
+        // Keeping this boundary typed to a small snapshot avoids coupling the
+        // roster manager to one ModernUO guild implementation.
+        public static Func<IReadOnlyList<PlayerGuildBotGuild>> GuildProvider
+        {
+            get
+            {
+                lock (LifecycleSync)
+                {
+                    return _guildProvider;
+                }
+            }
+            set
+            {
+                lock (LifecycleSync)
+                {
+                    _guildProvider = value;
+                }
+            }
+        }
+
+        // ModernUO invokes static Initialize methods after world loading. A
+        // zero-delay callback runs after all Initialize methods, including the
+        // ambient stale-bot purge, so stale roster deletions cannot respawn.
+        public static void Initialize()
+        {
+            lock (LifecycleSync)
+            {
+                if (_initialized)
+                {
+                    return;
+                }
+                _initialized = true;
+            }
+            ScheduleReconcile();
+        }
+
+        public static void OnGuildCreated(string guildId, string guildTag) =>
+            OnGuildCreated(new PlayerGuildBotGuild(guildId, guildTag));
+
+        public static void OnGuildCreated(PlayerGuildBotGuild guild)
+        {
+            if (!TryNormalizeGuild(guild, out var normalized))
+            {
+                return;
+            }
+
+            lock (LifecycleSync)
+            {
+                ActiveGuilds[normalized.Id] = normalized;
+                if (!GuildGenerations.ContainsKey(normalized.Id))
+                {
+                    GuildGenerations[normalized.Id] = 0;
+                }
+            }
+            ReconcileGuild(normalized);
+        }
+
+        public static void OnGuildDisbanded(string guildId)
+        {
+            if (!string.IsNullOrWhiteSpace(guildId))
+            {
+                RetireGuild(guildId.Trim());
+            }
+        }
+
+        public static void ScheduleReconcile()
+        {
+            lock (LifecycleSync)
+            {
+                if (!_initialized || _reconcileScheduled)
+                {
+                    return;
+                }
+                _reconcileScheduled = true;
+            }
+            Timer.DelayCall(TimeSpan.Zero, () =>
+            {
+                lock (LifecycleSync)
+                {
+                    _reconcileScheduled = false;
+                    _startupReconcilePending = false;
+                }
+                ReconcileAll();
+            });
+        }
+
+        public static void ReconcileAll()
+        {
+            PlayerGuildBotRosterSnapshot snapshot = ActiveSnapshot;
+            if (snapshot == null)
+            {
+                Console.WriteLine(
+                    "[PlayerGuildBotRoster] reconciliation skipped: no valid roster is active.");
+                return;
+            }
+
+            Func<IReadOnlyList<PlayerGuildBotGuild>> provider = GuildProvider;
+            if (provider == null)
+            {
+                Console.WriteLine(
+                    "[PlayerGuildBotRoster] reconciliation skipped: no native guild provider is registered.");
+                return;
+            }
+
+            IReadOnlyList<PlayerGuildBotGuild> supplied;
+            try
+            {
+                supplied = provider();
+                if (supplied == null)
+                {
+                    Console.WriteLine(
+                        "[PlayerGuildBotRoster] guild enumeration returned no snapshot; " +
+                        "reconciliation was not applied.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild enumeration failed: {ex.Message}");
+                return;
+            }
+
+            var active = new Dictionary<string, PlayerGuildBotGuild>(
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var guild in supplied)
+            {
+                if (TryNormalizeGuild(guild, out var normalized))
+                {
+                    active[normalized.Id] = normalized;
+                }
+            }
+
+            // The provider is authoritative. Retire known/state-only guilds
+            // absent from its active snapshot so no orphan identity remains.
+            foreach (var guildId in GetKnownGuildIds())
+            {
+                if (!active.ContainsKey(guildId))
+                {
+                    RetireGuild(guildId);
+                }
+            }
+
+            int created = 0;
+            int skipped = 0;
+            foreach (var guild in active.Values)
+            {
+                lock (LifecycleSync)
+                {
+                    ActiveGuilds[guild.Id] = guild;
+                    if (!GuildGenerations.ContainsKey(guild.Id))
+                    {
+                        GuildGenerations[guild.Id] = 0;
+                    }
+                }
+                ReconcileGuild(guild, ref created, ref skipped);
+            }
+
+            Console.WriteLine(
+                $"[PlayerGuildBotRoster] reconciled {active.Count} guild(s): " +
+                $"{created} created, {skipped} skipped.");
         }
 
         public static RosterLoadResult Reload()
@@ -154,8 +368,13 @@ namespace Server.CustomBots
                     Console.WriteLine(
                         $"[PlayerGuildBotRoster] loaded roster v{candidate.Version} " +
                         $"({candidate.Personas.Count} persona(s)).");
-                    return new RosterLoadResult(true, candidate.Version,
+                    var result = new RosterLoadResult(true, candidate.Version,
                         candidate.Personas.Count, Array.Empty<string>());
+                    if (_initialized)
+                    {
+                        ScheduleReconcile();
+                    }
+                    return result;
                 }
 
                 // Do not replace a working snapshot on a bad startup/reload.
@@ -176,6 +395,420 @@ namespace Server.CustomBots
                         ? new[] { "Roster candidate was empty or invalid." }
                         : errors.ToArray());
             }
+        }
+
+        private static void ReconcileGuild(
+            PlayerGuildBotGuild guild, ref int created, ref int skipped)
+        {
+            var snapshot = ActiveSnapshot;
+            if (snapshot == null)
+            {
+                return;
+            }
+
+            var configuredIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var persona in snapshot.Personas)
+            {
+                configuredIds.Add(persona.Id);
+                if (!ReconcilePersona(guild, snapshot, persona, out var wasCreated))
+                {
+                    skipped++;
+                }
+                if (wasCreated)
+                {
+                    created++;
+                }
+            }
+
+            // Removed personas retain their historical binding for a future
+            // re-add, but no longer keep a live bot or name reservation.
+            foreach (var binding in GetBindings(guild.Id))
+            {
+                if (!configuredIds.Contains(binding.PersonaId))
+                {
+                    RetirePersona(guild.Id, binding);
+                }
+            }
+        }
+
+        private static void ReconcileGuild(PlayerGuildBotGuild guild)
+        {
+            int created = 0;
+            int skipped = 0;
+            ReconcileGuild(guild, ref created, ref skipped);
+            if (created > 0 || skipped > 0)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' reconciliation: " +
+                    $"{created} created, {skipped} skipped.");
+            }
+        }
+
+        private static bool ReconcilePersona(
+            PlayerGuildBotGuild guild,
+            PlayerGuildBotRosterSnapshot snapshot,
+            PlayerGuildBotPersona persona,
+            out bool created)
+        {
+            created = false;
+            var bots = FindRosterBots(guild.Id, persona.Id);
+            PlayerBot live = bots.Count > 0 ? bots[0] : null;
+            for (int i = 1; i < bots.Count; i++)
+            {
+                DeleteRosterBot(bots[i]);
+            }
+
+            PlayerGuildBotRosterBinding binding;
+            if (!TryGetBinding(guild.Id, persona.Id, out binding))
+            {
+                var homeCity = BotHomeCities.RollHome();
+                if (string.IsNullOrWhiteSpace(homeCity))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        "skipped: no destination city is available for home-city assignment.");
+                    return false;
+                }
+
+                var formattedName = snapshot.FormatName(persona.BaseName, guild.Tag);
+                if (string.IsNullOrWhiteSpace(formattedName))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        "skipped: name format produced an empty name.");
+                    return false;
+                }
+                if (!TryGetOrCreateBinding(guild.Id, persona.Id, formattedName,
+                    homeCity, out binding, out created))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        "skipped: identity state is unavailable or unreadable.");
+                    return false;
+                }
+                if (created)
+                {
+                    SaveState();
+                }
+            }
+
+            var ownerKey = GetReservationOwner(guild.Id, persona.Id);
+            if (string.IsNullOrWhiteSpace(ownerKey))
+            {
+                return false;
+            }
+
+            if (live != null)
+            {
+                if (!string.Equals(live.Name, binding.ExactName,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        $"name mismatch: live '{live.Name}', state '{binding.ExactName}'; " +
+                        "manual repair required.");
+                    return false;
+                }
+                if (!NamePool.Reserve(binding.ExactName, ownerKey))
+                {
+                    Console.WriteLine(
+                        $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                        $"could not reserve live name '{binding.ExactName}'.");
+                    return false;
+                }
+                return true;
+            }
+
+            if (PlayerBot.IsRealPlayerNameInUse(binding.ExactName))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                    $"skipped: configured name '{binding.ExactName}' is used by a player; " +
+                    "choose a different baseName or format.");
+                return false;
+            }
+
+            if (!NamePool.Reserve(binding.ExactName, ownerKey))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                    $"skipped: configured name '{binding.ExactName}' conflicts with " +
+                    "another roster owner or live bot; no rename was attempted.");
+                return false;
+            }
+
+            var bot = PlayerBot.CreatePlayerGuildBot(
+                binding.ExactName,
+                persona.Female,
+                persona.Class,
+                persona.SkillTier,
+                persona.Behavior,
+                binding.HomeCity,
+                guild.Id,
+                persona.Id);
+            if (bot == null)
+            {
+                // Keep reservations for transient initialization failures, but
+                // a real-player conflict must remain unreserved and explicit.
+                if (PlayerBot.IsRealPlayerNameInUse(binding.ExactName))
+                {
+                    NamePool.ReleaseReservation(binding.ExactName, ownerKey);
+                }
+                return false;
+            }
+
+            if (!TryFindSpawnPoint(snapshot.SpawnRadius, bot, out var point))
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                    "has no valid destination/standable tile; identity remains reserved " +
+                    "for the next reconciliation.");
+                DeleteRosterBot(bot);
+                return false;
+            }
+
+            try
+            {
+                bot.MoveToWorld(point, Map.Felucca);
+                // Direct factory spawns have no Spawner to invoke this normal
+                // hook, so call it exactly once after placement.
+                bot.OnAfterSpawn();
+                SaveState();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] guild '{guild.Id}' persona '{persona.Id}' " +
+                    $"placement failed: {ex.Message}");
+                DeleteRosterBot(bot);
+                return false;
+            }
+        }
+
+        private static bool TryFindSpawnPoint(
+            int radius, PlayerBot bot, out Point3D point)
+        {
+            point = default;
+            var destination = DestinationCatalog.PickWeighted(bot);
+            if (destination == null)
+            {
+                return false;
+            }
+
+            Point3D anchor;
+            var arrival = destination.PickArrival();
+            if (arrival != null)
+            {
+                anchor = arrival.Point;
+            }
+            else
+            {
+                anchor = destination.ArrivalPoint ?? destination.Location;
+            }
+
+            if (!Walkable.NearestStandable(Map.Felucca, anchor.X, anchor.Y, radius,
+                out var x, out var y, out var z))
+            {
+                return false;
+            }
+
+            point = new Point3D(x, y, z);
+            return true;
+        }
+
+        private static void RetirePersona(
+            string guildId, PlayerGuildBotRosterBinding binding)
+        {
+            foreach (var bot in FindRosterBots(guildId, binding.PersonaId))
+            {
+                DeleteRosterBot(bot);
+            }
+            NamePool.ReleaseReservation(binding.ExactName,
+                GetReservationOwner(guildId, binding.PersonaId));
+        }
+
+        private static void RetireGuild(string guildId)
+        {
+            guildId = guildId?.Trim();
+            if (string.IsNullOrWhiteSpace(guildId))
+            {
+                return;
+            }
+
+            lock (LifecycleSync)
+            {
+                ActiveGuilds.Remove(guildId);
+                GuildGenerations[guildId] = GuildGenerations.TryGetValue(guildId,
+                    out var generation) ? generation + 1 : 1;
+                PendingRecoveryKeys.RemoveWhere(key => IsGuildKey(key, guildId));
+            }
+
+            var bots = FindRosterBots(guildId, null);
+            var bindings = GetBindings(guildId);
+            foreach (var bot in bots)
+            {
+                DeleteRosterBot(bot);
+            }
+            foreach (var binding in bindings)
+            {
+                NamePool.ReleaseReservation(binding.ExactName,
+                    GetReservationOwner(guildId, binding.PersonaId));
+            }
+
+            bool removed = RemoveGuildBindings(guildId);
+            if (removed)
+            {
+                SaveState();
+            }
+            Console.WriteLine(
+                $"[PlayerGuildBotRoster] retired guild '{guildId}': " +
+                $"{bots.Count} bot(s), {bindings.Count} binding(s).");
+        }
+
+        private static void DeleteRosterBot(PlayerBot bot)
+        {
+            if (bot == null || bot.Deleted)
+            {
+                return;
+            }
+
+            var key = MakeKey(bot.PlayerGuildId, bot.PlayerGuildPersonaId);
+            if (key != null)
+            {
+                lock (LifecycleSync)
+                {
+                    RetiringKeys.Add(key);
+                    PendingRecoveryKeys.Remove(key);
+                }
+            }
+            try
+            {
+                bot.Delete();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[PlayerGuildBotRoster] bot deletion failed for '{bot.Name}': " +
+                    ex.Message);
+            }
+            finally
+            {
+                if (key != null)
+                {
+                    lock (LifecycleSync)
+                    {
+                        RetiringKeys.Remove(key);
+                    }
+                }
+            }
+        }
+
+        private static void RecoverDeleted(string key, long generation)
+        {
+            string guildId;
+            string personaId;
+            PlayerGuildBotGuild guild;
+            lock (LifecycleSync)
+            {
+                PendingRecoveryKeys.Remove(key);
+                if (!TrySplitKey(key, out guildId, out personaId) ||
+                    !ActiveGuilds.TryGetValue(guildId, out guild) ||
+                    !guild.IsActive ||
+                    GuildGenerations.TryGetValue(guildId, out var current) &&
+                        current != generation)
+                {
+                    return;
+                }
+            }
+
+            var snapshot = ActiveSnapshot;
+            if (snapshot == null || !snapshot.TryGetPersona(personaId, out _))
+            {
+                return;
+            }
+            ReconcileGuild(guild);
+        }
+
+        private static List<PlayerBot> FindRosterBots(
+            string guildId, string personaId)
+        {
+            var found = new List<PlayerBot>();
+            foreach (var mobile in World.Mobiles.Values)
+            {
+                if (mobile is not PlayerBot bot || bot.Deleted ||
+                    !bot.IsPlayerGuildBot ||
+                    !string.Equals(bot.PlayerGuildId, guildId,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    (personaId != null && !string.Equals(bot.PlayerGuildPersonaId,
+                        personaId, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+                found.Add(bot);
+            }
+            return found;
+        }
+
+        private static string[] GetKnownGuildIds()
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            lock (LifecycleSync)
+            {
+                foreach (var id in ActiveGuilds.Keys)
+                {
+                    ids.Add(id);
+                }
+            }
+            lock (Sync)
+            {
+                foreach (var binding in _state.Bindings)
+                {
+                    if (!string.IsNullOrWhiteSpace(binding?.GuildId))
+                    {
+                        ids.Add(binding.GuildId.Trim());
+                    }
+                }
+            }
+            return ids.ToArray();
+        }
+
+        private static bool TryNormalizeGuild(
+            PlayerGuildBotGuild guild, out PlayerGuildBotGuild normalized)
+        {
+            normalized = null;
+            if (guild == null || !guild.IsActive ||
+                string.IsNullOrWhiteSpace(guild.Id) ||
+                string.IsNullOrWhiteSpace(guild.Tag))
+            {
+                return false;
+            }
+            normalized = new PlayerGuildBotGuild(
+                guild.Id.Trim(), guild.Tag.Trim(), isActive: true);
+            return true;
+        }
+
+        private static bool IsGuildKey(string key, string guildId) =>
+            key != null && key.StartsWith(guildId + '\u001f',
+                StringComparison.OrdinalIgnoreCase);
+
+        private static bool TrySplitKey(
+            string key, out string guildId, out string personaId)
+        {
+            guildId = null;
+            personaId = null;
+            if (string.IsNullOrEmpty(key))
+            {
+                return false;
+            }
+            int split = key.IndexOf('\u001f');
+            if (split <= 0 || split >= key.Length - 1)
+            {
+                return false;
+            }
+            guildId = key[..split];
+            personaId = key[(split + 1)..];
+            return true;
         }
 
         private static PlayerGuildBotRosterSnapshot Validate(
@@ -759,6 +1392,20 @@ namespace Server.CustomBots
             }
             return $"{guildId.Trim()}\u001f{personaId.Trim()}";
         }
+    }
+
+    public sealed class PlayerGuildBotGuild
+    {
+        public PlayerGuildBotGuild(string id, string tag, bool isActive = true)
+        {
+            Id = id;
+            Tag = tag;
+            IsActive = isActive;
+        }
+
+        public string Id { get; }
+        public string Tag { get; }
+        public bool IsActive { get; }
     }
 
     public sealed class RosterLoadResult

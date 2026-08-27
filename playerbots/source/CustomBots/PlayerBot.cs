@@ -437,7 +437,7 @@ namespace Server.CustomBots
             }
         }
 
-        private static bool IsRealPlayerNameInUse(string name)
+        public static bool IsRealPlayerNameInUse(string name)
         {
             foreach (var mobile in World.Mobiles.Values)
             {

@@ -77,6 +77,7 @@
  </div>
  <label style="color:#e8a0a0"><input type="checkbox" id="lPK" checked> PK spawns</label>
  <label style="color:#e07a5f"><input type="checkbox" id="lDigs"> Dig sites</label>
+ <label style="color:#7dc383"><input type="checkbox" id="lGather" checked> Gather spots</label>
  <label style="color:#ffae6e"><input type="checkbox" id="lCov"> WP coverage gaps</label>
  </details>
 
@@ -466,7 +467,7 @@ function draw(){
      ctx.fillRect(px-3,py-3,6,6);ctx.strokeRect(px-3,py-3,6,6);}}}
  }
 }
-["lEdges","lWps","lDests","lLabels","lSpawns","lPK","lDigs"].forEach(id=>document.getElementById(id).onchange=draw);
+["lEdges","lWps","lDests","lLabels","lSpawns","lPK","lDigs","lGather"].forEach(id=>document.getElementById(id).onchange=draw);
 document.querySelectorAll(".spF").forEach(c=>c.onchange=draw);
 let drag=null,moved=0;
 cv.onmousedown=e=>{
